@@ -8,6 +8,13 @@ Usage
     python train.py --gui            # same as default (backwards compat)
     python train.py --gui --device cpu --steps 5000   # GUI pre-filled
     python train.py --cli --device cuda:0 --num-threads 4
+    python train.py --cli --fresh    # ignore the saved model, start from zero
+
+Training is CUMULATIVE. If a saved model already exists, the next session
+continues from it (all it learned is kept; new characters in new data are
+added to its vocabulary). Your old model is only replaced when the new one
+scores better on the validation text, and it is backed up first whenever
+you explicitly start from scratch (see checkpoint_backups/).
 
 Data can be supplied three ways (they combine):
 
@@ -46,6 +53,7 @@ import os
 import queue
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -67,6 +75,10 @@ from model import (
     DEFAULT_DATA_DIRNAME,
     PROJECT_DIR,
     atomic_torch_save,
+    describe_checkpoint,
+    find_checkpoint,
+    load_state_expanding_vocab,
+    load_torch_file,
     resolve_checkpoint_path,
 )
 
@@ -88,14 +100,23 @@ except ImportError:
 #  6. TIE WEIGHTS     --tie-weights (needs embedding_dim==hidden_size).
 #  7. DROPOUT         0.1-0.3 for small data, lower for large.
 #  8. UNIGRAM INIT    On by default — free warmup savings.
+#  9. KEEP TRAINING   Sessions accumulate: every new session continues from
+#                     the saved model, so "a bit more training" is never lost.
 # ─────────────────────────────────────────────────────────────────────────
 
 BASE_CHARACTERS = (
     "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
     "&'@#.-()*=+/,?!:;[]{}\n"
 )
+# step         = CUMULATIVE step of the model (continues across sessions)
+# train_loss   = running average while training (dropout on, label smoothing on)
+# train_clean  = loss on a fixed slice of the training text, measured exactly
+#                like validation (no dropout, averaged weights) - the honest
+#                number to compare with val_loss when judging over-fitting
+# session      = 1 for a model's first training session, 2 for the next, ...
 LOG_COLUMNS = ["run_id", "step", "elapsed", "train_loss", "val_loss",
-               "lr", "grad_norm", "tokens_per_sec"]
+               "lr", "grad_norm", "tokens_per_sec", "train_clean", "session"]
+_LEGACY_LOG_COLUMNS = LOG_COLUMNS[:8]
 DEFAULT_DATA_EXTS = (".txt", ".text", ".md", ".json", ".jsonl", ".pdf")
 DEFAULT_DATA_EXTS_STR = ",".join(DEFAULT_DATA_EXTS)
 
@@ -111,14 +132,31 @@ def get_batch(data: torch.Tensor, batch_size: int, block_size: int):
 
 
 def prepare_log(path: Path):
+    """Open the CSV log for appending. Older logs are upgraded in place so the
+    history (and the dashboard's continuous curves) is never thrown away."""
     if path.exists() and path.stat().st_size > 0:
         with open(path, newline="") as f:
             header = next(csv.reader(f), [])
         if header != LOG_COLUMNS:
-            backup = path.with_name(
-                f"{path.stem}_old_{int(time.time())}{path.suffix}")
-            path.rename(backup)
-            print(f"Old-format log moved to {backup}")
+            if header == _LEGACY_LOG_COLUMNS:
+                try:
+                    with open(path, newline="") as f:
+                        rows = list(csv.reader(f))[1:]
+                    tmp = path.with_name(path.name + ".tmp")
+                    with open(tmp, "w", newline="") as f:
+                        w = csv.writer(f)
+                        w.writerow(LOG_COLUMNS)
+                        for r in rows:
+                            w.writerow(r + [""] * (len(LOG_COLUMNS) - len(r)))
+                    os.replace(tmp, path)
+                    print(f"Upgraded old log format: {path.name}")
+                except OSError as exc:
+                    print(f"warning: could not upgrade {path.name} ({exc})")
+            else:
+                backup = path.with_name(
+                    f"{path.stem}_old_{int(time.time())}{path.suffix}")
+                path.rename(backup)
+                print(f"Old-format log moved to {backup}")
     is_new = not path.exists() or path.stat().st_size == 0
     handle = open(path, "a", newline="")
     writer = csv.writer(handle)
@@ -129,11 +167,13 @@ def prepare_log(path: Path):
 
 
 def launch_live_plot(log_path: Path, run_id: str):
+    """Open the live dashboard. It shows every session of this model so the
+    curves continue where the previous session stopped."""
     script = Path(__file__).resolve().with_name("plot_results.py")
     try:
         return subprocess.Popen(
             [sys.executable, str(script), "--live",
-             "--log", str(log_path.resolve()), "--run-id", run_id]
+             "--log", str(log_path.resolve())]
         )
     except Exception as exc:
         print(f"(Could not open live plot window: {exc})")
@@ -201,6 +241,59 @@ def _fmt_hms(seconds: float) -> str:
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def fixed_windows(data: torch.Tensor, block_size: int, n: int):
+    """Evenly spaced, DETERMINISTIC windows over ``data``.
+
+    Random validation batches make the curve jitter and let a lucky draw win
+    "best checkpoint". Fixed windows mean every evaluation (and every
+    session) is measured on exactly the same text, so numbers are comparable.
+    """
+    last = data.numel() - block_size - 2          # largest legal start
+    n = max(1, min(int(n), last + 1))
+    starts = torch.linspace(0, last, n).round().long().to(data.device)
+    idx = starts[:, None] + torch.arange(block_size, device=data.device)[None, :]
+    return data[idx], data[idx + 1]
+
+
+def load_previous_checkpoint(path: Path) -> dict | None:
+    """Load the saved model at ``path`` for continued training.
+
+    Returns the checkpoint dict (tensors on CPU) or ``None`` if no file
+    exists. Raises ``RuntimeError`` when a file exists but cannot be used.
+    The weights are test-loaded into a throw-away model so every problem is
+    discovered *before* any training time is spent.
+    """
+    found = find_checkpoint(path, allow_fallback=False)
+    if found is None:
+        return None
+    ckpt = load_torch_file(found, "cpu")
+    need = ("characters", "embedding_dim", "hidden_size", "model_state_dict")
+    missing = [k for k in need if k not in ckpt]
+    if missing:
+        raise RuntimeError(f"file lacks {missing} (made by an older train.py?)")
+    probe = CharGRU(
+        len(ckpt["characters"]), int(ckpt["embedding_dim"]),
+        int(ckpt["hidden_size"]), int(ckpt.get("num_layers", 2)), 0.0,
+        tie_weights=bool(ckpt.get("tie_weights", False)))
+    load_state_expanding_vocab(
+        probe, ckpt["model_state_dict"], len(ckpt["characters"]))
+    ckpt["_path"] = str(found)
+    return ckpt
+
+
+def backup_checkpoint(path: Path) -> Path | None:
+    """Copy ``path`` into ``checkpoint_backups/`` (never lose a trained model)."""
+    try:
+        folder = path.parent / "checkpoint_backups"
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / f"{path.stem}_{time.strftime('%Y%m%d_%H%M%S')}{path.suffix}"
+        shutil.copy2(path, dest)
+        return dest
+    except OSError as exc:
+        print(f"warning: could not back up {path}: {exc}")
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -488,6 +581,8 @@ def _validate_training_args(args: argparse.Namespace) -> None:
                          "(0 disables weight averaging)")
     if args.grad_clip < 0:
         raise SystemExit("error: --grad-clip must be >= 0 (0 disables)")
+    if args.resume_lr_scale <= 0:
+        raise SystemExit("error: --resume-lr-scale must be > 0")
 
     # Data-specific validation
     try:
@@ -514,6 +609,59 @@ def run_training(args: argparse.Namespace) -> int:
     # ask.py can always find it. See model.resolve_checkpoint_path.
     args.checkpoint = str(resolve_checkpoint_path(args.checkpoint))
     print(f"Checkpoint will be saved to: {args.checkpoint}")
+    ckpt_path = Path(args.checkpoint)
+
+    # ── 0. Is there a saved model to CONTINUE from? ──────────────────
+    # Sessions are cumulative: unless --fresh is given, a model that already
+    # exists is loaded and trained further instead of being replaced.
+    resume_mode = "no" if args.fresh else args.resume
+    prev: dict | None = None
+    if resume_mode != "no":
+        try:
+            prev = load_previous_checkpoint(ckpt_path)
+        except Exception as exc:                     # noqa: BLE001
+            if resume_mode == "yes":
+                raise SystemExit(
+                    f"error: cannot continue the saved model: {exc}")
+            print(f"warning: the saved model could not be used ({exc}).\n"
+                  f"         Training a fresh model; the old file is backed "
+                  f"up first.")
+    if resume_mode == "yes" and prev is None:
+        raise SystemExit(f"error: --resume yes, but there is no saved model "
+                         f"at {ckpt_path}")
+    existing = find_checkpoint(ckpt_path, allow_fallback=False)
+    if prev is None and existing is not None:
+        dest = backup_checkpoint(existing)
+        if dest is not None:
+            print(f"Starting from zero. Your previous model was backed up "
+                  f"to: {dest}")
+
+    if prev is not None:
+        # The shape of the network is fixed by the saved weights.
+        locked = dict(
+            embedding_dim=int(prev["embedding_dim"]),
+            hidden_size=int(prev["hidden_size"]),
+            num_layers=int(prev.get("num_layers", 2)),
+            tie_weights=bool(prev.get("tie_weights", False)))
+        changed = [f"{k}: {getattr(args, k)} -> {v}"
+                   for k, v in locked.items() if getattr(args, k) != v]
+        for k, v in locked.items():
+            setattr(args, k, v)
+        print("Continuing from your existing model — "
+              + describe_checkpoint(prev) + ".")
+        print("  Everything it already learned is kept. "
+              "(Use --fresh to start from zero instead.)")
+        if changed:
+            print("  Network size is locked to the saved model: "
+                  + ", ".join(changed))
+    base_step = int((prev or {}).get("total_steps", (prev or {}).get("step", 0))
+                    or 0)
+    prev_sessions = int((prev or {}).get("sessions", 1) or 1) if prev else 0
+    session_no = prev_sessions + 1
+    lineage = list((prev or {}).get("lineage", []))
+    # Machine-readable line for the launcher GUI.
+    print(f"SESSION base_step={base_step} session={session_no} "
+          f"resumed={1 if prev is not None else 0}")
 
     # ── 1. Resolve specs → concrete file list ────────────────────────
     extensions = _parse_extensions(args.data_ext)
@@ -558,7 +706,21 @@ def run_training(args: argparse.Namespace) -> int:
             "(need at least 10,000).")
 
     # ── 3. Vocab + unigram prior (skip the separate bincount pass) ───
-    characters = sorted(set(char_counts) | set(BASE_CHARACTERS))
+    # A continued model keeps its old vocabulary order EXACTLY (so every
+    # learned weight still points at the right character) and only appends
+    # characters that are new in this data.
+    wanted = set(char_counts) | set(BASE_CHARACTERS)
+    if prev is not None:
+        prev_chars = list(prev["characters"])
+        extra = sorted(wanted - set(prev_chars))
+        characters = prev_chars + extra
+        if extra:
+            shown = "".join(extra)[:40]
+            print(f"New characters in this data: {len(extra)} ({shown!r}) — "
+                  f"added to the model's alphabet; old knowledge is kept.")
+    else:
+        prev_chars, extra = [], []
+        characters = sorted(wanted)
     stoi = {c: i for i, c in enumerate(characters)}
     itos = characters
 
@@ -580,7 +742,11 @@ def run_training(args: argparse.Namespace) -> int:
     train_data, val_data = ids[:split], ids[split:]
 
     # ── 5. Train ─────────────────────────────────────────────────────
-    torch.manual_seed(args.seed)
+    # A different seed every session: with a constant seed, session 2 would
+    # replay exactly the same random text windows as session 1 and learn
+    # nothing new from unchanged data.
+    run_seed = args.seed + 7919 * prev_sessions
+    torch.manual_seed(run_seed)
     device = resolve_device(args.device)
     configure_runtime(device, args.num_threads)
     train_data, val_data = train_data.to(device), val_data.to(device)
@@ -596,6 +762,8 @@ def run_training(args: argparse.Namespace) -> int:
         scaler = torch.cuda.amp.GradScaler(enabled=_scaler_on)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True   # free speed on Ampere+
+        torch.backends.cudnn.allow_tf32 = True
 
     def autocast():
         return torch.autocast(device_type=device.type, dtype=amp_dtype,
@@ -612,26 +780,38 @@ def run_training(args: argparse.Namespace) -> int:
         vocab, args.embedding_dim, args.hidden_size, args.num_layers,
         args.dropout, tie_weights=args.tie_weights,
     ).to(device)
-    if args.unigram_bias_init:
+    if prev is not None:
+        added = load_state_expanding_vocab(
+            model, prev["model_state_dict"], len(prev_chars))
+        print("Loaded the previous model's knowledge"
+              + (f" (+{added} new characters)" if added else "") + ".")
+    elif args.unigram_bias_init:
         model.init_output_bias(log_prior.to(device))
         print("Initialised output bias with unigram prior.")
     print(f"Parameters: {model.num_parameters:,}")
 
     decay = [q for q in model.parameters() if q.ndim >= 2]
     no_decay = [q for q in model.parameters() if q.ndim < 2]
+    # A model that is already trained must not be shaken by a full-size
+    # learning rate: continue more gently.
+    peak_lr = args.learning_rate * (args.resume_lr_scale
+                                    if prev is not None else 1.0)
+    if prev is not None and args.resume_lr_scale != 1.0:
+        print(f"Learning rate: peak {peak_lr:.2e} "
+              f"(x{args.resume_lr_scale:g} because the model is already trained)")
     optimizer = torch.optim.AdamW(
         [{"params": decay, "weight_decay": args.weight_decay},
          {"params": no_decay, "weight_decay": 0.0}],
-        lr=args.learning_rate, betas=(0.9, 0.95),
+        lr=peak_lr, betas=(0.9, 0.95),
     )
-    min_lr = args.learning_rate * args.min_lr_ratio
+    min_lr = peak_lr * args.min_lr_ratio
 
     def lr_at(step: int) -> float:
         if step <= args.warmup_steps:
-            return args.learning_rate * step / max(1, args.warmup_steps)
+            return peak_lr * step / max(1, args.warmup_steps)
         progress = (step - args.warmup_steps) / max(
             1, args.steps - args.warmup_steps)
-        return min_lr + 0.5 * (args.learning_rate - min_lr) * \
+        return min_lr + 0.5 * (peak_lr - min_lr) * \
                (1 + math.cos(math.pi * min(1.0, progress)))
 
     # Weight averaging: evaluation, samples and checkpoints all use the
@@ -645,22 +825,32 @@ def run_training(args: argparse.Namespace) -> int:
         return ema.average_weights(model) if ema is not None \
             else contextlib.nullcontext()
 
+    # Fixed evaluation windows: the SAME text every time, so the validation
+    # curve is smooth, honest and comparable between sessions.
+    n_eval = min(args.eval_batches * args.batch_size, 8192)
+    val_x, val_y = fixed_windows(val_data, args.block_size, n_eval)
+    tr_x, tr_y = fixed_windows(train_data, args.block_size, n_eval)
+    print(f"Validation uses {val_x.size(0):,} fixed text windows "
+          f"(same every time, so progress is measured fairly).")
+
     @torch.no_grad()
-    def eval_loss(data: torch.Tensor) -> float:
+    def eval_windows(xs: torch.Tensor, ys: torch.Tensor) -> float:
+        """Mean cross-entropy per character over fixed windows."""
         model.eval()
-        total = 0.0
+        total, count = 0.0, 0
         try:
             with averaged():
-                for _ in range(args.eval_batches):
-                    x, y = get_batch(data, args.batch_size, args.block_size)
+                for i in range(0, xs.size(0), args.batch_size):
+                    x, y = xs[i:i + args.batch_size], ys[i:i + args.batch_size]
                     with autocast():
                         logits = model(x)
                     total += F.cross_entropy(
-                        logits.float().reshape(-1, vocab),
-                        y.reshape(-1)).item()
+                        logits.float().reshape(-1, vocab), y.reshape(-1),
+                        reduction="sum").item()
+                    count += y.numel()
         finally:
             model.train()
-        return total / max(1, args.eval_batches)
+        return total / max(1, count)
 
     @torch.no_grad()
     def show_sample():
@@ -680,12 +870,18 @@ def run_training(args: argparse.Namespace) -> int:
     log_path = Path(args.log)
     handle, writer = prepare_log(log_path)
     Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
+    saved_any = False
 
-    def save_checkpoint(step_no: int, val_loss: float) -> None:
+    def save_checkpoint(step_in_session: int, val_loss: float) -> None:
         """Atomic write — a crash mid-save can't corrupt the last good file."""
+        nonlocal saved_any
         with averaged():
             weights = {k: t.detach().cpu().clone()
                        for k, t in model.state_dict().items()}
+        total = base_step + step_in_session
+        record = {"run_id": str(args.run_id), "session": session_no,
+                  "steps": int(step_in_session), "best_val": float(val_loss),
+                  "data_chars": int(n_chars), "time": int(time.time())}
         atomic_torch_save(
             {
                 "model_state_dict": weights,
@@ -697,15 +893,37 @@ def run_training(args: argparse.Namespace) -> int:
                 "num_layers": args.num_layers,
                 "dropout": args.dropout,
                 "tie_weights": args.tie_weights,
-                "best_validation_loss": val_loss,
-                "step": step_no,
+                "best_validation_loss": float(val_loss),
+                "step": total,                 # cumulative (shown by ask.py)
+                "total_steps": total,
+                "sessions": session_no,
+                "lineage": (lineage + [record])[-30:],
             },
             args.checkpoint)
+        saved_any = True
 
     viewer = None if args.no_live else launch_live_plot(log_path, args.run_id)
 
+    # Starting point: how good is the model we begin with, measured on THIS
+    # validation text? Only a better score replaces it on disk, so a bad
+    # session can never make the saved model worse.
     best_val, bad_evals, eval_count = math.inf, 0, 0
+    if prev is not None:
+        best_val = eval_windows(val_x, val_y)
+        start_clean = eval_windows(tr_x, tr_y)
+        print(f"The model you are continuing scores val {best_val:.4f} "
+              f"(perplexity {math.exp(min(best_val, 20)):.2f}). It will only "
+              f"be replaced by something better.")
+        writer.writerow([args.run_id, base_step, "0.0", "", f"{best_val:.4f}",
+                         "", "", "", f"{start_clean:.4f}", session_no])
+        handle.flush()
+
+    stop_file = Path(args.stop_file) if args.stop_file else None
+    if stop_file is not None:
+        stop_file.unlink(missing_ok=True)
+
     completed_steps = 0
+    diverged = False
     run_loss = torch.zeros((), device=device)
     run_n = 0
     t_start = t_last = time.time()
@@ -713,6 +931,9 @@ def run_training(args: argparse.Namespace) -> int:
 
     try:
         for step in range(1, args.steps + 1):
+            if stop_file is not None and stop_file.exists():
+                print("Stop requested — wrapping up…")
+                break
             lr = lr_at(step)
             for group in optimizer.param_groups:
                 group["lr"] = lr
@@ -751,14 +972,24 @@ def run_training(args: argparse.Namespace) -> int:
                       / max(1e-9, now - t_last)
                 run_loss.zero_(); run_n = 0
 
-                val_loss_str = ""
+                if not math.isfinite(train_loss):
+                    diverged = True
+                    print("Training DIVERGED (loss became NaN/inf). Your saved "
+                          "model was not touched. Lower the learning rate "
+                          "(try half) and start again.")
+                    break
+
+                val_loss_str = clean_str = ""
                 if do_eval:
-                    v = eval_loss(val_data)
-                    val_loss_str = f"{v:.4f}"
+                    v = eval_windows(val_x, val_y)
+                    tc = eval_windows(tr_x, tr_y)
+                    val_loss_str, clean_str = f"{v:.4f}", f"{tc:.4f}"
                     eval_count += 1
                     print(
                         f"step {step:6d} | train {train_loss:.4f} | val {v:.4f} | "
-                        f"ppl {math.exp(v):.2f} | lr {lr:.2e} | {tps:,.0f} chars/s"
+                        f"ppl {math.exp(min(v, 20)):.2f} | lr {lr:.2e} | "
+                        f"{tps:,.0f} chars/s | total {base_step + step:,} | "
+                        f"clean {tc:.4f}"
                     )
                     if v < best_val:
                         best_val, bad_evals = v, 0
@@ -769,10 +1000,12 @@ def run_training(args: argparse.Namespace) -> int:
                     if args.sample_every and eval_count % args.sample_every == 0:
                         show_sample()
 
+                gn = float(grad_norm)
                 writer.writerow(
-                    [args.run_id, step, f"{now - t_start:.1f}",
+                    [args.run_id, base_step + step, f"{now - t_start:.1f}",
                      f"{train_loss:.4f}", val_loss_str, f"{lr:.6g}",
-                     f"{float(grad_norm):.4f}", f"{tps:.0f}"])
+                     f"{gn:.4f}" if math.isfinite(gn) else "",
+                     f"{tps:.0f}", clean_str, session_no])
                 handle.flush()
                 t_last = time.time()
 
@@ -784,13 +1017,15 @@ def run_training(args: argparse.Namespace) -> int:
         print("\nInterrupted — wrapping up…")
     finally:
         handle.close()
+        if stop_file is not None:
+            stop_file.unlink(missing_ok=True)
 
-    # Stopped (Ctrl+C / GUI Stop) before the first validation eval? Then no
-    # checkpoint exists yet and ask.py would report "checkpoint not found".
-    # Evaluate once and save what we have so the run is never wasted.
-    if best_val == math.inf and completed_steps > 0:
+    # Stopped (Ctrl+C / GUI Stop) before the first validation eval of a
+    # FRESH model? Then no checkpoint exists yet and ask.py would report
+    # "checkpoint not found". Evaluate once and save what we have.
+    if best_val == math.inf and completed_steps > 0 and not diverged:
         try:
-            v = eval_loss(val_data)
+            v = eval_windows(val_x, val_y)
             best_val = v
             save_checkpoint(completed_steps, v)
             print(f"  saved checkpoint at step {completed_steps} "
@@ -800,23 +1035,32 @@ def run_training(args: argparse.Namespace) -> int:
 
     if best_val < math.inf:
         print(f"Training finished. Best validation loss: {best_val:.4f} "
-              f"(perplexity {math.exp(best_val):.2f})")
+              f"(perplexity {math.exp(min(best_val, 20)):.2f})")
     else:
         print("Training finished without a validation eval — no checkpoint "
               "saved.")
+    if saved_any:
+        print(f"Your model now has {base_step + completed_steps:,}+ total "
+              f"training steps across {session_no} session(s).")
+    elif prev is not None:
+        print("This session did not beat the model you started from, so your "
+              "saved model was left exactly as it was. Try: more steps, a "
+              "lower learning rate, or more/better training text.")
 
     try:
         from plot_results import save_static
-        save_static(str(log_path), "training_dashboard.png",
-                    run_id=args.run_id)
-        print("Saved final dashboard: training_dashboard.png")
+        out_png = str(log_path.resolve().with_name("training_dashboard.png"))
+        save_static(str(log_path), out_png)
+        print(f"Saved final dashboard: {out_png}")
     except Exception as exc:
         print(f"(Could not save final dashboard: {exc})")
 
+    if diverged:
+        return 1
     if best_val >= math.inf:
         print("Hint: increase --steps or lower --eval-interval so at least "
               "one validation eval runs.")
-    elif args.auto_chat:
+    elif args.auto_chat and saved_any:
         _maybe_launch_chat(Path(args.checkpoint))
     else:
         print("Next: run `python ask.py` to query the model.")
@@ -836,101 +1080,224 @@ GUI_ACCENT, GUI_ACCENT_FG, GUI_ERR = "#5eead4", "#0d0d14", "#f87171"
 GUI_MONO = ("TkFixedFont", 10)
 GUI_SANS = ("TkDefaultFont", 10)
 
+HELP_TITLE: dict[str, str] = {
+    "data": "Training text", "browse_dir": "Add a folder", "browse": "Add files",
+    "clear_data": "Clear the list", "checkpoint": "Model save file",
+    "log": "Training diary", "device": "Device", "num_threads": "CPU threads",
+    "steps": "Steps (training length)", "batch_size": "Batch size",
+    "block_size": "Block size", "learning_rate": "Learning rate",
+    "min_lr_ratio": "Final learning rate", "warmup_steps": "Warm-up",
+    "weight_decay": "Weight decay", "label_smoothing": "Label smoothing",
+    "grad_accum": "Gradient accumulation", "embedding_dim": "Embedding size",
+    "hidden_size": "Hidden size (brain size)", "num_layers": "Layers",
+    "dropout": "Dropout", "val_fraction": "Practice-test share",
+    "eval_interval": "Test every N steps", "eval_batches": "Test size",
+    "sample_every": "Show a sample", "patience": "Patience (auto-stop)",
+    "auto_chat": "Auto-open chat", "live_dashboard": "Live graphs",
+    "ema_decay": "Smoothed weights (EMA)", "grad_clip": "Gradient clip",
+    "json_keys": "JSON keys", "preset": "Presets", "tie": "Tie weights",
+    "unigram": "Smart start", "start": "Start", "stop": "Stop",
+    "help": "Full guide", "open_dashboard": "Dashboard", "open_chat": "Chat",
+    "resume": "Continue the existing model", "resume_lr_scale": "Gentle restart",
+    "advanced": "Advanced settings", "recommended": "Recommended preset",
+    "model_status": "Your saved model",
+    "card_step": "Step (this session)", "card_total": "Total steps (all sessions)",
+    "card_session": "Session number", "card_train": "Train loss",
+    "card_val": "Validation loss", "card_best": "Best validation loss",
+    "card_gap": "Overfit gap", "card_ppl": "Perplexity", "card_bpc": "Bits per character",
+    "card_lr": "Learning rate", "card_speed": "Speed", "card_elapsed": "Time elapsed",
+}
+
 HELP: dict[str, str] = {
-    "data": "Files, folders, or glob patterns. Directories and glob "
-            "matches are walked recursively, picking up files whose "
-            "extension is in --data-ext (.txt .text .md .json .jsonl .pdf by default). "
-            "Add as many specs as you like — 'Add folder…' stores a single "
-            "directory spec, so 20 000 files fit in one entry. Empty = "
-            "auto-detect 1.txt..10.txt in the working directory.",
-    "browse_dir": "Add a directory. Directories are stored as a single "
-                  "spec and expanded recursively by the loader using "
-                  "--data-ext (.txt .text .md .json .jsonl .pdf by default). Add as many "
-                  "folders as you like — the loader handles thousands of "
-                  "files without hitting command-line length limits.",
-    "checkpoint": "Where the best model is saved. Overwritten each time "
-                  "validation loss improves.",
-    "log": "CSV log used by the live dashboard. Rotated automatically when "
-           "the layout changes.",
-    "device": "Where to run training. 'Auto' picks CUDA if available, else "
-              "CPU. 'CPU' forces CPU. 'cuda:N (name)' picks a specific GPU.",
-    "num_threads": "Number of CPU worker threads (PyTorch). 0 = let PyTorch "
-                   "choose. Useful for CPU training and for the CPU parts of "
-                   "GPU training (data loading, checkpointing).",
-    "steps": "Total optimiser steps to run. Also determines the LR schedule "
-             "length (warmup + cosine decay).",
-    "batch_size": "Number of parallel training sequences per step.",
-    "block_size": "Length of each training sequence (BPTT window). Longer = "
-                  "better long-range dependencies, more GPU memory.",
-    "learning_rate": "Peak learning rate. Warmup ramps to this, then cosine "
-                     "decay to peak × min_lr_ratio.",
-    "min_lr_ratio": "Final LR = peak × this. A small tail (0.05) lets the "
-                    "model keep refining at the end of training.",
-    "warmup_steps": "Linear warmup steps. Prevents large early updates from "
-                    "destabilising training.",
-    "weight_decay": "AdamW L2 penalty on weight matrices (not on biases or "
-                    "LayerNorm). 0.01 is a safe default.",
-    "label_smoothing": "Smooths the target distribution to discourage "
-                       "over-confidence. 0.05-0.1 often improves val loss. "
-                       "Validation always reports plain cross-entropy.",
-    "grad_accum": "Accumulate N mini-batches before each optimiser step. "
-                  "Emulates a larger batch on a smaller GPU.",
-    "embedding_dim": "Character embedding size. Must equal hidden_size if "
-                     "'Tie weights' is on.",
-    "hidden_size": "GRU hidden state size. Bigger = more capacity, slower.",
-    "num_layers": "GRU depth. 2 is a strong default; 3+ for very large "
-                  "corpora.",
-    "dropout": "Dropout rate (0-0.5). Higher for small data, lower for large.",
-    "val_fraction": "Fraction of the corpus held out for validation. The "
-                    "split is the tail of the text, not a random mask.",
-    "eval_interval": "Steps between validation evaluations (and dashboard "
-                     "points).",
-    "eval_batches": "Number of validation batches averaged per evaluation. "
-                    "Higher = less noisy val loss.",
-    "sample_every": "Print a generated sample every N evaluations (0 = off). "
-                    "Handy sanity check during training.",
-    "patience": "Early stopping: stop after N evaluations without val "
-                "improvement (0 = disabled).",
-    "auto_chat": "Open the streaming chat window automatically when training "
-                 "finishes.",
-    "live_dashboard": "Open the live matplotlib dashboard in a separate "
-                      "process. Closing it does NOT stop training.",
-    "ema_decay": "Exponential moving average of the weights. The averaged "
-                 "model is what gets validated and saved — it is usually "
-                 "noticeably better than the raw weights at zero extra "
-                 "cost. 0.999 suits 5k+ steps; use 0.99 for short runs; "
-                 "0 disables.",
-    "grad_clip": "Maximum gradient norm (global clipping). 1.0 is a safe "
-                 "default; lower it if the 'Gradient norm' plot shows "
-                 "spikes. 0 disables clipping.",
-    "json_keys": "Only for .json / .jsonl training files. Comma-separated "
-                 "keys whose text to learn from, e.g. 'text,content'. "
-                 "Empty = every string value in the file. Use it to skip "
-                 "ids, urls and labels.",
-    "preset": "One-click starting points. They only fill in the fields "
-              "below — review or tweak anything before pressing Start.",
-    "open_dashboard": "Open the live plots window for this run (also "
-                      "works after training, for the saved log).",
-    "open_chat": "Open the chat window with the current checkpoint.",
-    "tie": "Share input embedding and output projection weights. Needs "
-           "embedding_dim == hidden_size. Regularises & saves parameters — "
-           "a good choice for small models.",
-    "unigram": "Seed the output bias with log p(char) measured on the corpus. "
-               "The model starts at a much lower loss than uniform noise, "
-               "saving warmup steps for free.",
-    "start": "Spawn the training subprocess with the current settings. Best "
-             "checkpoint is saved automatically whenever validation loss "
-             "improves.",
-    "stop": "Gracefully interrupt training (SIGINT). The best checkpoint so "
-            "far is preserved; the subprocess exits cleanly.",
-    "browse": "Open a file picker for training text. Selected files are "
-              "APPENDED to the current list — existing entries are kept. "
-              "Select multiple files at once with Ctrl/Shift-click in the "
-              "dialog. Use 'Clear' to reset the list.",
-    "clear_data": "Remove all entries from the training file list. "
-                  "Equivalent to deleting all text from the data field.",
-    "help": "Open the full reference: every hyperparameter, every tip, "
-            "and the loss-reduction playbook.",
+    # ── data & files ─────────────────────────────────────────────────
+    "data": "The text your AI learns from — think of it as the books you "
+            "give a student. Add .txt, .md, .json or .pdf files, or a whole "
+            "folder (sub-folders are included).\n\nMore and better text = a "
+            "smarter AI. If you leave this empty, the app looks in the "
+            "'data_to_train_on' folder next to the program.",
+    "browse_dir": "Pick a whole folder of text files. Everything useful "
+                  "inside (including sub-folders) is used. One folder can "
+                  "hold thousands of files.",
+    "browse": "Pick one or more files. They are ADDED to the list — nothing "
+              "you already added is removed. Hold Ctrl/Shift to select "
+              "several at once.",
+    "clear_data": "Empty the list of training text (does not delete any "
+                  "files from your computer).",
+    "checkpoint": "The save file for your AI's 'brain'. It is updated "
+                  "whenever the AI scores better on its practice test, and "
+                  "the Chat window reads the same file.\n\nLeave this alone "
+                  "unless you want to keep several different AIs: give each "
+                  "its own file name.",
+    "log": "A diary (CSV spreadsheet) of the training. The live graphs "
+           "are drawn from it, and every new session adds to it so you "
+           "can see the whole history.",
+    # ── your model ───────────────────────────────────────────────────
+    "model_status": "Shows whether a trained AI already exists in the save "
+                    "file and how much training it has had.\n\nGREEN = a "
+                    "model exists and the next session will build on it.\n"
+                    "GREY = nothing saved yet, training starts from zero.",
+    "resume": "ON (recommended): the AI keeps everything it already learned "
+              "and simply studies more. Each session makes it smarter on top "
+              "of the last one. If your new text has letters it has never "
+              "seen, they are added automatically.\n\nOFF: throw away its "
+              "knowledge and start from zero. Your old model is copied to "
+              "the 'checkpoint_backups' folder first, so nothing is lost.\n\n"
+              "While ON, the brain size (layers / hidden size / embedding) "
+              "is locked to the saved model, because a trained brain "
+              "cannot change shape.",
+    "resume_lr_scale": "When continuing an already-trained AI, learning "
+                       "gently is safer than learning at full strength "
+                       "(a big nudge can make it forget). 0.5 means 'half "
+                       "strength'.\n\nGood value: 0.3 – 1.0. Use 1.0 if you "
+                       "are teaching it something very different.",
+    # ── device ───────────────────────────────────────────────────────
+    "device": "The part of your computer that does the heavy maths. A "
+              "graphics card (CUDA) is typically 10–50× faster than the "
+              "normal processor (CPU).\n\n'Auto' picks the best one. Leave "
+              "it on Auto if unsure.",
+    "num_threads": "How many CPU cores to use. 0 = automatic (best for most "
+                   "people). Only change it if your computer becomes "
+                   "unresponsive while training — then try a smaller number "
+                   "like 2 or 4.",
+    # ── length / schedule ────────────────────────────────────────────
+    "steps": "How long to train in THIS session. One step = the AI studies "
+             "a batch of text and adjusts itself a tiny bit.\n\nRough "
+             "guide:\n• 1,500 — quick test (minutes)\n• 8,000 — normal on a "
+             "CPU\n• 20,000+ — serious run on a GPU\n\nIf you continue an "
+             "existing model, these steps are ADDED to what it already had.",
+    "batch_size": "How many text snippets the AI studies at the same time. "
+                  "Bigger = steadier learning but needs more memory.\n\nIf "
+                  "you see an 'out of memory' error, halve this number.",
+    "block_size": "How many letters the AI reads in one snippet — how far "
+                  "back it can 'remember' while reading. 256 is a good "
+                  "balance. Bigger remembers more but is slower and "
+                  "needs more memory.",
+    "learning_rate": "How big each learning 'nudge' is. Too small = slow "
+                     "learning. Too big = the AI gets confused and the loss "
+                     "graph jumps around.\n\nGood value: 0.002. If the "
+                     "graph goes wild, halve it.",
+    "min_lr_ratio": "Learning slows down gradually during the session. This "
+                    "is the final speed as a fraction of the starting "
+                    "speed. 0.05 = it ends at 5% — a gentle landing that "
+                    "squeezes out the last improvements.",
+    "warmup_steps": "At the start the AI begins with tiny nudges and ramps "
+                    "up to full speed over this many steps. It prevents "
+                    "early chaos. Good value: 100–400.",
+    "weight_decay": "A tiny 'forgetting' pressure that stops the AI from "
+                    "memorising instead of understanding. 0.01 is safe; "
+                    "use 0.05–0.1 when you have very little text.",
+    "label_smoothing": "Teaches the AI not to be over-confident. 0 = off. "
+                       "0.05 often gives a small improvement when the AI "
+                       "starts to overfit. (Test scores are always measured "
+                       "without it, so they stay honest.)",
+    "grad_accum": "Pretend to have a bigger batch on a small computer by "
+                  "collecting N batches before each learning step. 1 = "
+                  "normal. Raise it if 'batch size' is limited by memory.",
+    # ── architecture ─────────────────────────────────────────────────
+    "embedding_dim": "How many numbers describe each letter. Small is fine "
+                     "(64). Must equal 'Hidden size' only if you turn on "
+                     "'Tie weights'.\n\nLocked while you continue an "
+                     "existing model.",
+    "hidden_size": "The size of the AI's 'brain' (memory per layer). Bigger "
+                   "= can learn more complicated things, but slower and "
+                   "hungrier for data. 256 = small, 512 = medium, "
+                   "768+ = large.\n\nLocked while you continue an existing "
+                   "model.",
+    "num_layers": "How many brain layers are stacked. 2 is a strong "
+                  "default; 3+ only helps with a lot of text.\n\nLocked "
+                  "while you continue an existing model.",
+    "dropout": "Randomly 'switches off' part of the brain while studying so "
+               "it can't just memorise. 0.1 for lots of text, 0.2–0.3 if "
+               "you have very little.",
+    # ── validation ───────────────────────────────────────────────────
+    "val_fraction": "The AI is tested on text it has NEVER studied — a "
+                    "practice exam. This is the share of your text kept "
+                    "aside for that (taken from the end). 0.05 = 5%.",
+    "eval_interval": "Run the practice exam every N steps. Each exam adds "
+                     "one point to the graphs and, if the score is the "
+                     "best so far, saves the AI.",
+    "eval_batches": "How much text each practice exam uses. Bigger = a more "
+                    "trustworthy score but a slightly slower exam. 20 is "
+                    "plenty for most cases.",
+    "sample_every": "Every N exams, print a short piece of text the AI "
+                    "wrote, so you can see with your own eyes how it is "
+                    "doing. 0 = never.",
+    "patience": "Auto-stop: end the session if the exam score has not "
+                "improved for N exams in a row. 0 = never stop early.",
+    # ── options ──────────────────────────────────────────────────────
+    "auto_chat": "Open the Chat window automatically when training "
+                 "finishes, so you can talk to your AI straight away.",
+    "live_dashboard": "Open the live graphs window while training. Closing "
+                      "it does NOT stop the training.",
+    "tie": "A trick for small AIs: reuse the same numbers for reading and "
+           "writing letters. Saves memory and often helps. Requires "
+           "'Embedding size' = 'Hidden size'.\n\nLocked while you continue "
+           "an existing model.",
+    "unigram": "Starts the AI already knowing how common each letter is "
+               "(e.g. 'e' is common, 'z' is rare) instead of guessing "
+               "blindly. A free head-start; keep it on. (Only used when "
+               "starting from zero.)",
+    # ── advanced ─────────────────────────────────────────────────────
+    "ema_decay": "Keeps a slowly-moving AVERAGE of the brain and uses that "
+                 "for tests and saving. It is almost always better than "
+                 "the raw brain, for free.\n\nGood value: 0.999 for "
+                 "5,000+ steps, 0.99 for short runs. 0 = off.",
+    "grad_clip": "A safety limit on how violent one learning step may be. "
+                 "Prevents blow-ups. 1.0 is a safe default; lower it if "
+                 "the 'Gradient norm' graph shows big spikes. 0 = off.",
+    "json_keys": "Only for .json/.jsonl files. List the fields that contain "
+                 "real text, e.g.  text,content  — everything else (ids, "
+                 "links, labels) is ignored. Empty = use all text fields.",
+    "preset": "One-click starting points. They only fill in the boxes — "
+              "check them, then press Start.\n\n• Quick test: finish in "
+              "minutes\n• CPU friendly: sensible without a graphics card\n• "
+              "Balanced: good on a mid-range GPU\n• High quality: best "
+              "results, needs a strong GPU",
+    "recommended": "The preset that suits THIS computer best, guessed from "
+                   "whether you have a graphics card.",
+    "advanced": "Fine-tuning controls (brain size, learning speed, tests, "
+                "safety limits). The defaults and presets are good — you "
+                "can ignore this whole section if you are new.",
+    # ── buttons ──────────────────────────────────────────────────────
+    "start": "Begin training with the settings shown. The AI is saved "
+             "automatically whenever it improves.  Shortcut: Ctrl+Enter.",
+    "stop": "Stop training safely. The best version so far is already "
+            "saved, so nothing is lost.",
+    "help": "A plain-English guide to every setting and how to read the "
+            "graphs.",
+    "open_dashboard": "Open the live graphs window (also works after "
+                      "training, to look at the history).",
+    "open_chat": "Open the Chat window to talk to the saved AI.",
+    # ── live metric cards ────────────────────────────────────────────
+    "card_step": "How many learning steps this session has done so far.",
+    "card_total": "All the steps this AI has EVER done, across all "
+                  "sessions. This number only goes up when you continue "
+                  "an existing model — proof that training accumulates.",
+    "card_session": "Which training session this is for this AI. #1 = "
+                    "first time, #2 = the second time you trained it, "
+                    "and so on.",
+    "card_train": "The AI's mistakes on the text it is studying. Lower = "
+                  "better. It should fall quickly, then slowly.",
+    "card_val": "The AI's mistakes on its practice exam (text it has never "
+                "studied). THIS is the number that matters. Green = it "
+                "improved since the last exam.",
+    "card_best": "The best exam score reached so far. This is the version "
+                 "that is saved to disk.",
+    "card_gap": "Exam score minus study score (measured the same way). Near "
+                "0 = healthy. Growing steadily = the AI is memorising "
+                "instead of understanding (overfitting): add more text or "
+                "raise dropout.",
+    "card_ppl": "'How many letters is the AI torn between?' on average. "
+                "Lower is better; 1 would be perfect. 3 means it is "
+                "choosing between about 3 likely letters each time.",
+    "card_bpc": "The same score in 'bits per letter' (how many yes/no "
+                "questions are needed to guess the next letter). Lower is "
+                "better; English text is ~1.0–1.5 for good models.",
+    "card_lr": "How big the learning nudges are right now. It rises during "
+               "warm-up, then slowly shrinks.",
+    "card_speed": "How many letters per second are being studied. Higher "
+                  "= faster training.",
+    "card_elapsed": "Time since this session started.",
 }
 
 
@@ -942,8 +1309,9 @@ class Tooltip:
     """
 
     def __init__(self, widget, text: str, delay: int = 450,
-                 clickable: bool = True):
+                 clickable: bool = True, title: str = "Help"):
         self.widget, self.text, self.delay = widget, text, delay
+        self.title = title
         self._tip = None
         self._after_id = None
         widget.bind("<Enter>", self._on_enter, add="+")
@@ -967,7 +1335,7 @@ class Tooltip:
         self._on_leave()
         try:
             from tkinter import messagebox
-            messagebox.showinfo("Help", self.text)
+            messagebox.showinfo(self.title, self.text)
         except Exception:
             pass
 
@@ -984,8 +1352,8 @@ class Tooltip:
         tk.Label(
             tip, text=self.text, justify="left",
             background=GUI_PANEL2, foreground=GUI_TEXT,
-            relief="solid", borderwidth=1, font=("TkDefaultFont", 9),
-            padx=10, pady=6, wraplength=340).pack()
+            relief="solid", borderwidth=1, font=("TkDefaultFont", 10),
+            padx=12, pady=8, wraplength=400).pack()
         self._tip = tip
 
     def _hide(self):
@@ -1001,9 +1369,9 @@ def _help_badge(parent, key: str):
     """Create a small '?' badge next to a widget."""
     import tkinter as tk
     label = tk.Label(parent, text=" ? ", bg=GUI_PANEL2, fg=GUI_ACCENT,
-                     cursor="hand2", font=(GUI_SANS[0], 8, "bold"),
+                     cursor="hand2", font=(GUI_SANS[0], 9, "bold"),
                      padx=3, pady=0)
-    Tooltip(label, HELP.get(key, ""))
+    Tooltip(label, HELP.get(key, ""), title=HELP_TITLE.get(key, "Help"))
     return label
 
 
@@ -1071,7 +1439,10 @@ PRESETS: dict[str, dict] = {
 
 _STEP_LINE = re.compile(
     r"^\s*step\s+(\d+)\s+\|\s+train\s+([\d.]+)\s+\|\s+val\s+([\d.]+)\s+\|"
-    r"\s+ppl\s+(\S+)\s+\|\s+lr\s+(\S+)\s+\|\s+([\d,]+)\s+chars/s")
+    r"\s+ppl\s+(\S+)\s+\|\s+lr\s+(\S+)\s+\|\s+([\d,]+)\s+chars/s"
+    r"(?:\s+\|\s+total\s+([\d,]+))?(?:\s+\|\s+clean\s+([\d.]+))?")
+_SESSION_LINE = re.compile(
+    r"^SESSION base_step=(\d+) session=(\d+) resumed=(\d)")
 
 
 def _fmt_num(v: float) -> str:
@@ -1098,6 +1469,10 @@ class TrainingLauncher:
         self._last_csv_poll = 0.0
         self._best_val = math.inf
         self._prev_val = math.inf
+        self.step_offset = 0
+        self._stop_file: Path | None = None
+        self._arch_locked = False
+        self._existing: dict | None = None
 
         self._apply_theme()
         self._build()
@@ -1129,6 +1504,8 @@ class TrainingLauncher:
         style.configure("TEntry", fieldbackground=GUI_PANEL,
                         foreground=GUI_TEXT, insertcolor=GUI_ACCENT,
                         borderwidth=0)
+        style.map("TEntry", foreground=[("disabled", GUI_DIM)],
+                  fieldbackground=[("disabled", GUI_BG)])
         style.configure("TCombobox", fieldbackground=GUI_PANEL,
                         background=GUI_PANEL, foreground=GUI_TEXT,
                         arrowcolor=GUI_ACCENT, borderwidth=0)
@@ -1164,7 +1541,8 @@ class TrainingLauncher:
         tk.Label(header, text="◆  Training Launcher", bg=GUI_PANEL,
                  fg=GUI_ACCENT, font=(GUI_SANS[0], 12, "bold"),
                  padx=16).pack(side=tk.LEFT, pady=14)
-        tk.Label(header, text="character-level GRU  ·  EMA-averaged weights",
+        tk.Label(header,
+                 text="hover or click any  ?  for a plain-English explanation",
                  bg=GUI_PANEL, fg=GUI_DIM, font=(GUI_SANS[0], 9),
                  padx=16).pack(side=tk.RIGHT)
         tk.Frame(self.root, bg=GUI_BORDER, height=1).pack(fill=tk.X)
@@ -1195,10 +1573,16 @@ class TrainingLauncher:
         self.preset_var = tk.StringVar(value="Select a preset…")
         preset_combo = ttk.Combobox(
             pbar, textvariable=self.preset_var, values=list(PRESETS),
-            state="readonly", width=26)
+            state="readonly", width=22)
         preset_combo.pack(side=tk.LEFT)
         preset_combo.bind("<<ComboboxSelected>>",
                           lambda _e: self._apply_preset())
+        rec = self._recommended_preset()
+        rec_btn = ttk.Button(
+            pbar, text=f"★ Use recommended ({rec.split(' (')[0]})",
+            command=lambda: self._apply_named_preset(rec))
+        rec_btn.pack(side=tk.LEFT, padx=(10, 0))
+        Tooltip(rec_btn, HELP["recommended"], clickable=False)
 
         canvas = tk.Canvas(left, bg=GUI_BG, highlightthickness=0)
         scroll = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
@@ -1242,6 +1626,7 @@ class TrainingLauncher:
         self.root.bind("<Control-Return>", lambda _e: self._start())
 
         self.vars: dict[str, tk.StringVar] = {}
+        self.entries: dict[str, ttk.Entry] = {}
 
         def field(parent, row, label, key, default, width=14, col=0,
                   colspan=1, padx=(0, 28)):
@@ -1251,20 +1636,25 @@ class TrainingLauncher:
             badge.grid(row=row, column=col + 1, sticky="w", padx=(2, 6))
             var = tk.StringVar(value=str(self.defaults.get(key, default)))
             self.vars[key] = var
-            ttk.Entry(parent, textvariable=var, width=width).grid(
-                row=row, column=col + 2, columnspan=colspan,
-                sticky="w", padx=padx, pady=3)
+            entry = ttk.Entry(parent, textvariable=var, width=width)
+            entry.grid(row=row, column=col + 2, columnspan=colspan,
+                       sticky="w", padx=padx, pady=3)
+            self.entries[key] = entry
 
         def pair(parent, row, l1, k1, d1, l2, k2, d2):
             field(parent, row, l1, k1, d1, col=0)
             field(parent, row, l2, k2, d2, col=3)
 
+        def section(parent, row, text, first=False):
+            ttk.Label(parent, text=text, style="Section.TLabel").grid(
+                row=row, column=0, columnspan=6, sticky="w",
+                pady=(4, 6) if first else (16, 6))
+
         # ── DATA ─────────────────────────────────────────────────
-        ttk.Label(form, text="DATA & OUTPUT", style="Section.TLabel").grid(
-            row=0, column=0, columnspan=6, sticky="w", pady=(4, 6))
+        section(form, 0, "DATA & OUTPUT", first=True)
 
         # Row 1: label + ? + entry (spans columns 2-6)
-        tk.Label(form, text="Data specs", bg=GUI_BG, fg=GUI_TEXT).grid(
+        tk.Label(form, text="Training text", bg=GUI_BG, fg=GUI_TEXT).grid(
             row=1, column=0, sticky="w", pady=3)
         _help_badge(form, "data").grid(row=1, column=1, sticky="w",
                                        padx=(2, 6))
@@ -1287,7 +1677,7 @@ class TrainingLauncher:
         # Row 2: hint (left) + button bar (right)
         tk.Label(
             form,
-            text="Files, folders, or globs — resolved recursively at launch.",
+            text="Files, folders or globs. Empty = the 'data_to_train_on' folder.",
             bg=GUI_BG, fg=GUI_DIM).grid(
             row=2, column=2, columnspan=2, sticky="w")
 
@@ -1310,18 +1700,47 @@ class TrainingLauncher:
         clear_btn.pack(side=tk.LEFT)
         Tooltip(clear_btn, HELP["clear_data"], clickable=False)
 
-        field(form, 3, "Checkpoint", "checkpoint", DEFAULT_CHECKPOINT_NAME,
+        field(form, 3, "Model file", "checkpoint", DEFAULT_CHECKPOINT_NAME,
               width=62, col=0, colspan=3, padx=(0, 0))
         field(form, 4, "Log file", "log", "training_log.csv",
               width=62, col=0, colspan=3, padx=(0, 0))
+        self.entries["checkpoint"].bind(
+            "<FocusOut>", lambda _e: self._refresh_model_info(), add="+")
+        self.entries["checkpoint"].bind(
+            "<Return>", lambda _e: self._refresh_model_info(), add="+")
+
+        # ── YOUR MODEL (does the next session continue or restart?) ───
+        section(form, 5, "YOUR MODEL")
+        status_row = tk.Frame(form, bg=GUI_PANEL, highlightthickness=1,
+                              highlightbackground=GUI_BORDER)
+        status_row.grid(row=6, column=0, columnspan=6, sticky="we",
+                        pady=(0, 6))
+        self.model_status = tk.Label(
+            status_row, text="", bg=GUI_PANEL, fg=GUI_TEXT, anchor="w",
+            justify="left", wraplength=520, padx=12, pady=8,
+            font=(GUI_SANS[0], 10))
+        self.model_status.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        _help_badge(status_row, "model_status").pack(
+            side=tk.RIGHT, padx=8, pady=8)
+
+        resume_row = tk.Frame(form, bg=GUI_BG)
+        resume_row.grid(row=7, column=0, columnspan=6, sticky="w", pady=2)
+        self.opt_resume = tk.BooleanVar(
+            value=not bool(self.defaults.get("fresh", False))
+            and self.defaults.get("resume", "auto") != "no")
+        self.resume_cb = ttk.Checkbutton(
+            resume_row, text="Continue training the existing model "
+                             "(keep everything it learned)",
+            variable=self.opt_resume, command=self._refresh_model_info)
+        self.resume_cb.pack(side=tk.LEFT)
+        _help_badge(resume_row, "resume").pack(side=tk.LEFT, padx=(4, 0))
 
         # ── DEVICE ───────────────────────────────────────────────
-        ttk.Label(form, text="DEVICE", style="Section.TLabel").grid(
-            row=5, column=0, columnspan=6, sticky="w", pady=(16, 6))
+        section(form, 8, "DEVICE")
 
         tk.Label(form, text="Device", bg=GUI_BG, fg=GUI_TEXT).grid(
-            row=6, column=0, sticky="w", pady=3)
-        _help_badge(form, "device").grid(row=6, column=1, sticky="w",
+            row=9, column=0, sticky="w", pady=3)
+        _help_badge(form, "device").grid(row=9, column=1, sticky="w",
                                         padx=(2, 6))
         self._device_entries = _detect_devices()
         self._device_displays = [d for d, _ in self._device_entries]
@@ -1334,59 +1753,30 @@ class TrainingLauncher:
         self.device_combo = ttk.Combobox(
             form, textvariable=self.device_var, values=self._device_displays,
             state="readonly", width=34)
-        self.device_combo.grid(row=6, column=2, sticky="w", padx=(0, 28),
+        self.device_combo.grid(row=9, column=2, sticky="w", padx=(0, 28),
                                pady=3)
 
         tk.Label(form, text="CPU threads", bg=GUI_BG, fg=GUI_TEXT).grid(
-            row=6, column=3, sticky="w", pady=3)
+            row=9, column=3, sticky="w", pady=3)
         _help_badge(form, "num_threads").grid(
-            row=6, column=4, sticky="w", padx=(2, 6))
+            row=9, column=4, sticky="w", padx=(2, 6))
         self.vars["num_threads"] = tk.StringVar(
             value=str(self.defaults.get("num_threads", 0) or 0))
         ttk.Entry(form, textvariable=self.vars["num_threads"], width=8).grid(
-            row=6, column=5, sticky="w", pady=3)
+            row=9, column=5, sticky="w", pady=3)
 
-        # ── MODEL ────────────────────────────────────────────────
-        ttk.Label(form, text="MODEL ARCHITECTURE",
-                  style="Section.TLabel").grid(
-            row=7, column=0, columnspan=6, sticky="w", pady=(16, 6))
-        pair(form, 8, "Embedding dim", "embedding_dim", 64,
-             "Hidden size", "hidden_size", 512)
-        pair(form, 9, "Num layers", "num_layers", 2,
-             "Dropout", "dropout", 0.1)
-
-        # ── OPTIMIZATION ─────────────────────────────────────────
-        ttk.Label(form, text="OPTIMIZATION", style="Section.TLabel").grid(
-            row=10, column=0, columnspan=6, sticky="w", pady=(16, 6))
-        pair(form, 11, "Steps", "steps", 20000,
-             "Batch size", "batch_size", 128)
-        pair(form, 12, "Block size", "block_size", 256,
-             "Learning rate", "learning_rate", 0.002)
-        pair(form, 13, "Warmup steps", "warmup_steps", 200,
-             "Min LR ratio", "min_lr_ratio", 0.05)
-        pair(form, 14, "Weight decay", "weight_decay", 0.01,
-             "Label smoothing", "label_smoothing", 0.0)
-        pair(form, 15, "Val fraction", "val_fraction", 0.05,
-             "Grad accum", "grad_accum", 1)
-        pair(form, 16, "Eval interval", "eval_interval", 250,
-             "Eval batches", "eval_batches", 20)
-
-        # ── ADVANCED ─────────────────────────────────────────────
-        ttk.Label(form, text="ADVANCED", style="Section.TLabel").grid(
-            row=17, column=0, columnspan=6, sticky="w", pady=(16, 6))
-        pair(form, 18, "Sample every", "sample_every", 4,
-             "Patience", "patience", 0)
-        pair(form, 19, "EMA decay", "ema_decay", 0.999,
-             "Grad clip", "grad_clip", 1.0)
-        field(form, 20, "JSON keys", "json_keys", "", width=34, col=0,
-              colspan=3, padx=(0, 0))
+        # ── TRAINING LENGTH ──────────────────────────────────────
+        section(form, 10, "TRAINING LENGTH")
+        field(form, 11, "Steps", "steps", 20000, col=0)
+        self.total_hint = tk.Label(form, text="", bg=GUI_BG, fg=GUI_DIM,
+                                   anchor="w", justify="left")
+        self.total_hint.grid(row=11, column=3, columnspan=3, sticky="w")
 
         # ── OPTIONS ──────────────────────────────────────────────
-        ttk.Label(form, text="OPTIONS", style="Section.TLabel").grid(
-            row=21, column=0, columnspan=6, sticky="w", pady=(16, 6))
+        section(form, 12, "OPTIONS")
 
         opt_row = tk.Frame(form, bg=GUI_BG)
-        opt_row.grid(row=22, column=0, columnspan=6, sticky="w", pady=4)
+        opt_row.grid(row=13, column=0, columnspan=6, sticky="w", pady=4)
 
         def opt(parent, text, var, key, padx=(0, 4)):
             cb = ttk.Checkbutton(parent, text=text, variable=var)
@@ -1404,11 +1794,53 @@ class TrainingLauncher:
         self.opt_unigram = tk.BooleanVar(
             value=bool(self.defaults.get("unigram_bias_init", True)))
 
-        opt(opt_row, "Auto-launch chat", self.opt_auto_chat, "auto_chat")
-        opt(opt_row, "Live dashboard", self.opt_live, "live_dashboard")
-        opt(opt_row, "Tie weights", self.opt_tie, "tie")
-        opt(opt_row, "Unigram bias init", self.opt_unigram, "unigram",
+        opt(opt_row, "Auto-open chat", self.opt_auto_chat, "auto_chat")
+        opt(opt_row, "Live graphs", self.opt_live, "live_dashboard")
+        self.tie_cb = opt(opt_row, "Tie weights", self.opt_tie, "tie")
+        opt(opt_row, "Smart start", self.opt_unigram, "unigram",
             padx=(0, 4))
+
+        # ── ADVANCED (collapsed by default) ──────────────────────
+        adv_row = tk.Frame(form, bg=GUI_BG)
+        adv_row.grid(row=14, column=0, columnspan=6, sticky="w",
+                     pady=(18, 4))
+        self.adv_btn = ttk.Button(adv_row, text="▸  Show advanced settings",
+                                  command=self._toggle_advanced)
+        self.adv_btn.pack(side=tk.LEFT)
+        _help_badge(adv_row, "advanced").pack(side=tk.LEFT, padx=(6, 0))
+
+        adv = tk.Frame(form, bg=GUI_BG)
+        adv.grid(row=15, column=0, columnspan=6, sticky="we")
+        adv.grid_remove()
+        self.adv = adv
+        self._adv_open = False
+
+        section(adv, 0, "MODEL ARCHITECTURE", first=True)
+        pair(adv, 1, "Embedding size", "embedding_dim", 64,
+             "Hidden size", "hidden_size", 512)
+        pair(adv, 2, "Layers", "num_layers", 2,
+             "Dropout", "dropout", 0.1)
+        section(adv, 3, "OPTIMIZATION")
+        pair(adv, 4, "Batch size", "batch_size", 128,
+             "Block size", "block_size", 256)
+        pair(adv, 5, "Learning rate", "learning_rate", 0.002,
+             "Final LR ratio", "min_lr_ratio", 0.05)
+        pair(adv, 6, "Warm-up steps", "warmup_steps", 200,
+             "Gentle restart", "resume_lr_scale", 0.5)
+        pair(adv, 7, "Weight decay", "weight_decay", 0.01,
+             "Label smoothing", "label_smoothing", 0.0)
+        pair(adv, 8, "Test share", "val_fraction", 0.05,
+             "Grad accum", "grad_accum", 1)
+        pair(adv, 9, "Test every", "eval_interval", 250,
+             "Test size", "eval_batches", 20)
+        section(adv, 10, "SAFETY & EXTRAS")
+        pair(adv, 11, "Sample every", "sample_every", 4,
+             "Patience", "patience", 0)
+        pair(adv, 12, "EMA decay", "ema_decay", 0.999,
+             "Grad clip", "grad_clip", 1.0)
+        field(adv, 13, "JSON keys", "json_keys", "", width=34, col=0,
+              colspan=3, padx=(0, 0))
+        adv.columnconfigure(5, weight=1)
 
         # ── CONTROLS ─────────────────────────────────────────────
         self._ctrl = ctrl
@@ -1427,7 +1859,7 @@ class TrainingLauncher:
         _help_badge(ctrl, "stop").pack(side=tk.LEFT, padx=(4, 20))
         Tooltip(self.stop_btn, HELP["stop"], clickable=False)
 
-        help_btn = ttk.Button(ctrl, text="?  Help",
+        help_btn = ttk.Button(ctrl, text="?  Guide",
                               command=self._show_help)
         help_btn.pack(side=tk.RIGHT)
         Tooltip(help_btn, HELP["help"], clickable=False)
@@ -1441,29 +1873,117 @@ class TrainingLauncher:
 
         self._build_monitor(right)
         form.columnconfigure(5, weight=1)
+        self._refresh_model_info()
+
+    def _toggle_advanced(self):
+        self._adv_open = not self._adv_open
+        if self._adv_open:
+            self.adv.grid()
+            self.adv_btn.configure(text="▾  Hide advanced settings")
+        else:
+            self.adv.grid_remove()
+            self.adv_btn.configure(text="▸  Show advanced settings")
+
+    @staticmethod
+    def _recommended_preset() -> str:
+        try:
+            if torch.cuda.is_available():
+                gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+                return "High quality (GPU)" if gb >= 10 else \
+                    "Balanced (default)"
+        except Exception:
+            pass
+        return "CPU friendly"
+
+    def _refresh_model_info(self):
+        """Tell the user, in plain words, whether the next session will
+        continue an existing model, and lock the brain size if so."""
+        tk = self.tk
+        info = None
+        try:
+            path = resolve_checkpoint_path(
+                self.vars["checkpoint"].get().strip() or None)
+            found = find_checkpoint(path, allow_fallback=False)
+            if found is not None:
+                ckpt = load_torch_file(found, "cpu")
+                if all(k in ckpt for k in
+                       ("characters", "embedding_dim", "hidden_size")):
+                    info = ckpt
+        except Exception:
+            info = None
+        self._existing = info
+        continuing = info is not None and bool(self.opt_resume.get())
+
+        if info is None:
+            text, color = ("No saved model yet — the first session starts "
+                           "from zero. After that, every new session "
+                           "automatically continues from it.", GUI_DIM)
+            hint = ""
+        elif continuing:
+            text, color = (f"✔ Saved model found — {describe_checkpoint(info)}."
+                           f"\nThis session will CONTINUE from it: nothing it "
+                           f"learned is lost.", "#86efac")
+            hint = ("adds on top of the "
+                    f"{int(info.get('total_steps', info.get('step', 0)) or 0):,}"
+                    " steps it already has")
+        else:
+            text, color = (f"⚠ Saved model found — {describe_checkpoint(info)}."
+                           f"\nYou chose to start from zero. The old model is "
+                           f"copied to 'checkpoint_backups' first.", "#fbbf24")
+            hint = ""
+        self.model_status.configure(text=text, fg=color)
+        self.total_hint.configure(text=hint)
+
+        # A trained brain cannot change shape: show and lock its size.
+        self._arch_locked = continuing
+        if continuing:
+            self.vars["embedding_dim"].set(str(int(info["embedding_dim"])))
+            self.vars["hidden_size"].set(str(int(info["hidden_size"])))
+            self.vars["num_layers"].set(str(int(info.get("num_layers", 2))))
+            self.opt_tie.set(bool(info.get("tie_weights", False)))
+        state = tk.DISABLED if continuing else tk.NORMAL
+        for key in ("embedding_dim", "hidden_size", "num_layers"):
+            try:
+                self.entries[key].configure(state=state)
+            except Exception:
+                pass
+        try:
+            self.tie_cb.configure(state=state)
+        except Exception:
+            pass
 
     # ── live monitor (right pane) ────────────────────────────────────
     def _build_monitor(self, parent):
         tk, ttk = self.tk, self.ttk
         wrap = tk.Frame(parent, bg=GUI_BG)
         wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
-        ttk.Label(wrap, text="LIVE METRICS", style="Section.TLabel").pack(
-            anchor="w", pady=(4, 6))
+        ttk.Label(wrap, text="LIVE METRICS  (click a ? to learn what it means)",
+                  style="Section.TLabel").pack(anchor="w", pady=(4, 6))
 
         grid = tk.Frame(wrap, bg=GUI_BG)
         grid.pack(fill=tk.X)
         self.cards: dict[str, tk.Label] = {}
-        specs = [("step", "STEP"), ("train", "TRAIN LOSS"),
-                 ("val", "VAL LOSS"), ("best", "BEST VAL"),
-                 ("ppl", "PERPLEXITY"), ("bpc", "BITS / CHAR"),
-                 ("lr", "LEARNING RATE"), ("speed", "CHARS / SEC")]
-        for i, (key, title) in enumerate(specs):
+        specs = [("step", "STEP (SESSION)", "card_step"),
+                 ("total", "TOTAL STEPS", "card_total"),
+                 ("session", "SESSION #", "card_session"),
+                 ("train", "TRAIN LOSS", "card_train"),
+                 ("val", "VAL LOSS", "card_val"),
+                 ("best", "BEST VAL", "card_best"),
+                 ("gap", "OVERFIT GAP", "card_gap"),
+                 ("ppl", "PERPLEXITY", "card_ppl"),
+                 ("bpc", "BITS / CHAR", "card_bpc"),
+                 ("lr", "LEARNING RATE", "card_lr"),
+                 ("speed", "CHARS / SEC", "card_speed"),
+                 ("elapsed", "ELAPSED", "card_elapsed")]
+        for i, (key, title, hkey) in enumerate(specs):
             card = tk.Frame(grid, bg=GUI_PANEL, highlightthickness=1,
                             highlightbackground=GUI_BORDER)
             card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=4, pady=4)
-            tk.Label(card, text=title, bg=GUI_PANEL, fg=GUI_DIM,
-                     font=(GUI_SANS[0], 8, "bold")).pack(
-                anchor="w", padx=12, pady=(10, 0))
+            top = tk.Frame(card, bg=GUI_PANEL)
+            top.pack(fill=tk.X, padx=(12, 6), pady=(8, 0))
+            tk.Label(top, text=title, bg=GUI_PANEL, fg=GUI_DIM,
+                     font=(GUI_SANS[0], 8, "bold")).pack(side=tk.LEFT)
+            _help_badge(top, hkey).pack(side=tk.RIGHT)
             val = tk.Label(card, text="—", bg=GUI_PANEL, fg=GUI_TEXT,
                            font=(GUI_SANS[0], 16, "bold"))
             val.pack(anchor="w", padx=12, pady=(0, 10))
@@ -1502,17 +2022,20 @@ class TrainingLauncher:
             lbl.configure(text="—", fg=GUI_TEXT)
         self._best_val = math.inf
         self._prev_val = math.inf
+        self.step_offset = 0
 
     def _update_metrics(self, line: str):
         m = _STEP_LINE.match(line)
         if not m:
             return
-        step, train, val, ppl, lr, tps = m.groups()
+        step, train, val, ppl, lr, tps, total, clean = m.groups()
         try:
             v = float(val)
         except ValueError:
             return
         self.cards["step"].configure(text=f"{int(step):,}")
+        if total:
+            self.cards["total"].configure(text=total)
         self.cards["train"].configure(text=train)
         improved = v < self._prev_val
         self.cards["val"].configure(
@@ -1522,6 +2045,12 @@ class TrainingLauncher:
             self._best_val = v
         self.cards["best"].configure(text=f"{self._best_val:.4f}",
                                      fg=GUI_ACCENT)
+        if clean:
+            gap = v - float(clean)
+            rel = gap / max(v, 1e-9)
+            colour = ("#86efac" if rel < 0.10 else
+                      "#fbbf24" if rel < 0.25 else GUI_ERR)
+            self.cards["gap"].configure(text=f"{gap:+.3f}", fg=colour)
         self.cards["ppl"].configure(text=ppl)
         self.cards["bpc"].configure(text=f"{v / math.log(2):.3f}")
         self.cards["lr"].configure(text=lr)
@@ -1548,9 +2077,11 @@ class TrainingLauncher:
             for row in reversed(tail.splitlines()):
                 parts = row.split(",")
                 if len(parts) >= 8 and parts[0] == self.run_id:
-                    step = int(parts[1])
+                    gstep = int(parts[1])               # cumulative step
+                    step = max(0, gstep - self.step_offset)
                     self._set_progress(step)
                     self.cards["step"].configure(text=f"{step:,}")
+                    self.cards["total"].configure(text=f"{gstep:,}")
                     if parts[3]:
                         self.cards["train"].configure(text=parts[3])
                     if parts[5]:
@@ -1572,6 +2103,7 @@ class TrainingLauncher:
         rate = step / elapsed if elapsed > 0 else 0.0
         remaining = ((self.total_steps - step) / rate
                      if rate > 0 else float("inf"))
+        self.cards["elapsed"].configure(text=_fmt_hms(elapsed))
         self.status_label.configure(
             text=f"Step {step:,}/{self.total_steps:,}  ·  {pct:.1f}%  ·  "
                  f"elapsed {_fmt_hms(elapsed)}  ·  ETA {_fmt_hms(remaining)}")
@@ -1580,26 +2112,32 @@ class TrainingLauncher:
         except Exception:
             pass
 
+    def _apply_named_preset(self, name: str):
+        self.preset_var.set(name)
+        self._apply_preset()
+
     def _apply_preset(self):
         preset = PRESETS.get(self.preset_var.get())
         if not preset or self.proc is not None:
             return
+        locked = ({"embedding_dim", "hidden_size", "num_layers"}
+                  if getattr(self, "_arch_locked", False) else set())
         for key, value in preset.items():
-            if key in self.vars:
+            if key in self.vars and key not in locked:
                 self.vars[key].set(str(value))
-        if self.opt_tie.get() and preset["embedding_dim"] != \
-                preset["hidden_size"]:
+        if not locked and self.opt_tie.get() and \
+                preset["embedding_dim"] != preset["hidden_size"]:
             self.opt_tie.set(False)
+        note = (" (brain size kept: it belongs to your saved model)"
+                if locked else "")
         self.status_label.configure(
-            text=f"Preset '{self.preset_var.get()}' applied — review, then "
-                 f"press Start (Ctrl+Enter).")
+            text=f"Preset '{self.preset_var.get()}' applied{note} — review, "
+                 f"then press Start (Ctrl+Enter).")
 
     def _open_dashboard(self):
         script = Path(__file__).resolve().with_name("plot_results.py")
         cmd = [sys.executable, str(script), "--live",
                "--log", str(self._log_file())]
-        if self.run_id and self.proc is not None:
-            cmd += ["--run-id", self.run_id]
         try:
             subprocess.Popen(cmd)
         except Exception as exc:
@@ -1750,7 +2288,7 @@ class TrainingLauncher:
                     "sample_every", "patience", "num_threads"]
         float_keys = ["dropout", "learning_rate", "min_lr_ratio",
                       "weight_decay", "label_smoothing", "val_fraction",
-                      "ema_decay", "grad_clip"]
+                      "ema_decay", "grad_clip", "resume_lr_scale"]
         try:
             for k in int_keys:
                 v = int(self.vars[k].get())
@@ -1780,6 +2318,8 @@ class TrainingLauncher:
                                      "(0 disables)")
                 if k == "grad_clip" and v < 0:
                     raise ValueError("grad_clip must be >= 0 (0 disables)")
+                if k == "resume_lr_scale" and v <= 0:
+                    raise ValueError("resume_lr_scale must be > 0")
                 if k == "val_fraction" and not (0.0 < v < 1.0):
                     raise ValueError("val_fraction must be in (0, 1)")
         except ValueError as exc:
@@ -1844,7 +2384,8 @@ class TrainingLauncher:
                     "warmup_steps", "weight_decay", "label_smoothing",
                     "val_fraction", "eval_interval", "eval_batches",
                     "grad_accum", "sample_every", "patience",
-                    "num_threads", "ema_decay", "grad_clip"]:
+                    "num_threads", "ema_decay", "grad_clip",
+                    "resume_lr_scale"]:
             cmd += [f"--{key.replace('_', '-')}", self.vars[key].get()]
         self.run_id = uuid.uuid4().hex[:8]
         cmd += ["--run-id", self.run_id]
@@ -1859,6 +2400,11 @@ class TrainingLauncher:
             cmd.append("--no-live")
         if not self.opt_auto_chat.get():
             cmd.append("--no-auto-chat")
+        if not self.opt_resume.get():
+            cmd.append("--fresh")
+        self._stop_file = Path(tempfile.gettempdir()) / \
+            f"ai_trainer_stop_{self.run_id}.flag"
+        cmd += ["--stop-file", str(self._stop_file)]
         return cmd, tmp_manifest
 
     def _start(self):
@@ -1873,6 +2419,7 @@ class TrainingLauncher:
         self.status_label.configure(text="Starting…")
         self.start_btn.configure(state=self.tk.DISABLED)
         self.stop_btn.configure(state=self.tk.NORMAL)
+        self.resume_cb.configure(state=self.tk.DISABLED)
         self.train_start_ts = time.time()
 
         cmd, self._temp_manifest = self._build_cmd()
@@ -1926,6 +2473,12 @@ class TrainingLauncher:
         self.root.after(120, self._poll_log)
 
     def _update_progress(self, line: str):
+        sm = _SESSION_LINE.match(line)
+        if sm:
+            self.step_offset = int(sm.group(1))
+            self.cards["session"].configure(text=f"#{sm.group(2)}")
+            self.cards["total"].configure(text=f"{self.step_offset:,}")
+            return
         m = re.search(r"step\s+(\d+)\s+\|", line)
         if m and self.total_steps > 0:
             self._set_progress(int(m.group(1)))
@@ -1965,16 +2518,28 @@ class TrainingLauncher:
                     "Stop the training subprocess?\nThe best checkpoint so "
                     "far is preserved."):
                 return
-        # SIGINT is what Ctrl+C sends — train.py catches it as
-        # KeyboardInterrupt, runs its finally block, and exits cleanly with
-        # the checkpoint intact.
+        # POSIX: SIGINT is what Ctrl+C sends — train.py catches it as
+        # KeyboardInterrupt, runs its finally block and exits cleanly.
+        # Windows has no equivalent signal, so train.py watches for a "stop
+        # file" instead (checked every step); terminate() is the last resort.
         try:
             if sys.platform == "win32":
-                self.proc.terminate()
+                if self._stop_file is not None:
+                    self._stop_file.write_text("stop")
+                self.status_label.configure(
+                    text="Stopping after the current step…")
+                self.root.after(60000, self._force_kill)
             else:
                 self.proc.send_signal(signal.SIGINT)
         except Exception:
             pass
+
+    def _force_kill(self):
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except Exception:
+                pass
 
     def _cleanup_temp_manifest(self):
         if self._temp_manifest is not None:
@@ -2000,33 +2565,66 @@ class TrainingLauncher:
     def _show_help(self):
         tk = self.tk
         win = tk.Toplevel(self.root)
-        win.title("Hyperparameter reference")
+        win.title("Guide — plain-English reference")
         win.configure(bg=GUI_BG)
-        win.geometry("720x640")
-        text = tk.Text(win, bg=GUI_PANEL, fg=GUI_TEXT, font=GUI_MONO,
-                       wrap=tk.WORD, padx=16, pady=12, relief=tk.FLAT)
+        win.geometry("760x680")
+        text = tk.Text(win, bg=GUI_PANEL, fg=GUI_TEXT, font=(GUI_SANS[0], 10),
+                       wrap=tk.WORD, padx=18, pady=14, relief=tk.FLAT)
         text.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
-        lines = ["HYPERPARAMETER REFERENCE\n" + "=" * 44 + "\n\n"]
+        text.tag_configure("h", foreground=GUI_ACCENT,
+                           font=(GUI_SANS[0], 12, "bold"), spacing1=10,
+                           spacing3=4)
+        text.tag_configure("k", foreground=GUI_ACCENT,
+                           font=(GUI_SANS[0], 10, "bold"), spacing1=8)
+
+        def h(t):
+            text.insert(tk.END, t + "\n", "h")
+
+        h("QUICK START")
+        text.insert(tk.END,
+                    "1.  Put your text files in the 'data_to_train_on' folder "
+                    "(or use Add files / Add folder).\n"
+                    "2.  Click  ★ Use recommended.\n"
+                    "3.  Press  ▶ Start training.\n"
+                    "4.  Watch VAL LOSS. Lower is smarter. When it stops "
+                    "improving, you are done — or train again: every new "
+                    "session CONTINUES from where the last one ended, so the "
+                    "AI keeps getting smarter.\n")
+        h("DOES TRAINING ACCUMULATE?")
+        text.insert(tk.END,
+                    "Yes. With 'Continue training the existing model' ticked "
+                    "(the default), each session starts from the saved AI, "
+                    "not from zero. TOTAL STEPS keeps growing. The saved AI "
+                    "is only replaced when the new version scores better on "
+                    "the practice exam, so a bad session can never make it "
+                    "worse. Untick the box to start from zero — the old AI "
+                    "is backed up first.\n")
+        h("HOW TO READ THE NUMBERS")
+        text.insert(tk.END,
+                    "• VAL LOSS — mistakes on text the AI has never studied. "
+                    "The one that matters. Lower = smarter.\n"
+                    "• TRAIN LOSS — mistakes on text it is studying. Should "
+                    "fall.\n"
+                    "• OVERFIT GAP — if it keeps growing while VAL LOSS "
+                    "stops improving, the AI is memorising: add more text.\n"
+                    "• PERPLEXITY / BITS PER CHAR — the same score in "
+                    "friendlier units.\n")
+        h("EVERY SETTING")
         for key, help_text in HELP.items():
-            lines.append(f"▸ {key}\n  {help_text}\n\n")
-        lines.append("\n" + "=" * 44 + "\n")
-        lines.append("LOSS-REDUCTION PLAYBOOK (priority order)\n")
-        lines.append("=" * 44 + "\n\n")
-        lines.append(
-            "1. MORE DATA — a ~2M-param GRU saturates around 5-10M "
-            "characters. Add text before tuning anything else.\n\n"
-            "2. BIGGER BLOCK SIZE — --block-size 512 exposes longer "
-            "dependencies. Halve --batch-size to keep memory flat.\n\n"
-            "3. LABEL SMOOTHING — --label-smoothing 0.05 often gives a small "
-            "validation-loss win.\n\n"
-            "4. WEIGHT DECAY — 0.01 is safe; 0.05-0.1 on very small "
-            "corpora.\n\n"
-            "5. LOWER PEAK LR — if training spikes, halve --learning-rate.\n\n"
-            "6. TIE WEIGHTS — --tie-weights (needs "
-            "embedding_dim==hidden_size).\n\n"
-            "7. DROPOUT — 0.1-0.3 for small data, lower for large.\n\n"
-            "8. UNIGRAM INIT — on by default; free warmup savings.\n")
-        text.insert("1.0", "".join(lines))
+            if key.startswith("card_"):
+                continue
+            text.insert(tk.END, HELP_TITLE.get(key, key) + "\n", "k")
+            text.insert(tk.END, help_text + "\n")
+        h("HOW TO MAKE THE AI SMARTER (in order of impact)")
+        text.insert(tk.END,
+                    "1. MORE (and cleaner) TEXT — nothing beats this.\n"
+                    "2. KEEP TRAINING — run more sessions; they add up.\n"
+                    "3. BIGGER 'Block size' (e.g. 512) so it remembers "
+                    "further back; halve 'Batch size' to save memory.\n"
+                    "4. If VAL LOSS rises while TRAIN LOSS falls: more "
+                    "text, higher Dropout, or Label smoothing 0.05.\n"
+                    "5. If the loss graph spikes: halve the Learning rate.\n"
+                    "6. Leave 'Smoothed weights (EMA)' and 'Smart start' on.\n")
         text.configure(state=tk.DISABLED)
         tk.Button(win, text="Close", command=win.destroy,
                   bg=GUI_PANEL2, fg=GUI_TEXT, relief=tk.FLAT,
@@ -2041,6 +2639,11 @@ class TrainingLauncher:
             pass
         self.start_btn.configure(state=self.tk.NORMAL)
         self.stop_btn.configure(state=self.tk.DISABLED)
+        try:
+            self.resume_cb.configure(state=self.tk.NORMAL)
+            self._refresh_model_info()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -2136,6 +2739,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-interval", type=int, default=25)
     p.add_argument("--sample-every", type=int, default=4)
     p.add_argument("--patience", type=int, default=0)
+    # Continuing a saved model
+    p.add_argument("--resume", choices=("auto", "yes", "no"), default="auto",
+                   help="auto (default): continue the saved model if there is "
+                        "one. yes: require one. no: start from zero (the old "
+                        "file is backed up first).")
+    p.add_argument("--fresh", action="store_true",
+                   help="Shortcut for --resume no: ignore the saved model and "
+                        "start from zero (it is backed up first).")
+    p.add_argument("--resume-lr-scale", type=float, default=0.5,
+                   help="Multiply the peak learning rate by this when "
+                        "continuing an already-trained model (default 0.5).")
+    p.add_argument("--stop-file", default=None, help=argparse.SUPPRESS)
     return p
 
 

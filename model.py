@@ -127,6 +127,75 @@ def atomic_torch_save(obj, path) -> None:
                 pass
 
 
+def load_torch_file(path, device="cpu"):
+    """``torch.load`` that prefers the safe ``weights_only`` mode.
+
+    Checkpoints written by train.py contain only tensors, numbers, strings,
+    lists and dicts, so the safe loader handles them. If a PyTorch version
+    rejects something, fall back to the classic loader (the file is the
+    user's own).
+    """
+    try:
+        return torch.load(path, map_location=device, weights_only=True)
+    except TypeError:                       # very old PyTorch: no weights_only=
+        return torch.load(path, map_location=device)
+    except Exception:                       # unpickling restriction -> retry
+        return torch.load(path, map_location=device, weights_only=False)
+
+
+# Layers whose first dimension is the vocabulary size.
+_VOCAB_KEYS = ("embedding.weight", "output.weight", "output.bias")
+
+
+@torch.no_grad()
+def load_state_expanding_vocab(model: nn.Module, state: dict, old_vocab: int) -> int:
+    """Load ``state`` into ``model``; the model may have a LARGER vocabulary.
+
+    This is what lets a second training session use text that contains
+    characters the first session never saw: the new characters are appended
+    to the vocabulary (old ids never move), every old weight is kept, and
+    only the brand-new rows start fresh.
+
+    Returns the number of vocabulary rows that were added (0 = exact match).
+    Raises ``RuntimeError`` when the shapes cannot be reconciled (for example
+    a different hidden size) so the caller can fall back to a fresh model.
+    """
+    own = model.state_dict()
+    added = 0
+    for key, src in state.items():
+        if key not in own:
+            raise RuntimeError(f"checkpoint has unexpected weight '{key}'")
+        dst = own[key]
+        src = src.to(dst.device, dst.dtype)
+        if src.shape == dst.shape:
+            dst.copy_(src)
+        elif (key in _VOCAB_KEYS and src.shape[0] == old_vocab
+              and dst.shape[0] > old_vocab and src.shape[1:] == dst.shape[1:]):
+            dst[:old_vocab].copy_(src)
+            if key == "output.bias":        # new chars: start as 'rare'
+                dst[old_vocab:] = src.min()
+            added = dst.shape[0] - old_vocab
+        else:
+            raise RuntimeError(
+                f"weight '{key}' has shape {tuple(src.shape)} in the "
+                f"checkpoint but {tuple(dst.shape)} in the new model")
+    missing = [k for k in own if k not in state]
+    if missing:
+        raise RuntimeError(f"checkpoint is missing weight '{missing[0]}'")
+    return added
+
+
+def describe_checkpoint(ckpt: dict) -> str:
+    """One human-readable line about a loaded checkpoint dict."""
+    steps = int(ckpt.get("total_steps", ckpt.get("step", 0)) or 0)
+    sessions = int(ckpt.get("sessions", 1) or 1)
+    best = ckpt.get("best_validation_loss")
+    bits = f"{steps:,} steps over {sessions} session{'s' if sessions != 1 else ''}"
+    if isinstance(best, (int, float)) and best == best and best != float("inf"):
+        bits += f", best validation loss {best:.4f}"
+    return bits
+
+
 class EMA:
     """Exponential moving average of a model's parameters.
 
@@ -435,10 +504,7 @@ class CharGRU(nn.Module):
         path = found
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        try:
-            ckpt = torch.load(path, map_location=device, weights_only=True)
-        except TypeError:  # older PyTorch without weights_only=
-            ckpt = torch.load(path, map_location=device)
+        ckpt = load_torch_file(path, device)
 
         required = ("characters", "embedding_dim", "hidden_size")
         missing = [k for k in required if k not in ckpt]

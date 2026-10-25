@@ -192,7 +192,8 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
     print(c.bold("◆  Ai-Trainer---Chatter") + c.dim(" — terminal REPL"))
     print(c.dim(f"  checkpoint: {checkpoint_path.resolve()}"))
     print(c.dim(f"  best val loss: {ckpt.get('best_validation_loss', float('nan')):.4f}"
-                f"  |  step {ckpt.get('step', '?')}"))
+                f"  |  step {ckpt.get('step', '?')}"
+                f"  |  {ckpt.get('sessions', 1)} training session(s)"))
     _stats_line()
     print(c.dim("  type /help for commands, /quit to exit\n"))
 
@@ -422,23 +423,28 @@ GUI_ERR, GUI_NOTICE = "#f87171", "#a78bfa"
 GUI_NAME_USER, GUI_NAME_AI = "#5eead4", "#86efac"
 
 HELP: dict[str, str] = {
-    "temperature": "Controls randomness. 0 = greedy (always the most likely "
+    "temperature": "The creativity dial. Low = safe and predictable, high = "
+                   "wild and surprising. Good value: 0.7.\n\nTechnically: controls randomness. 0 = greedy (always the most likely "
                    "next char). 0.5-0.9 is the sweet spot for coherent-but-"
                    "creative output. Above ~1.2 tends to produce gibberish.",
-    "top_k": "At each step, sample only from the k most likely next characters. "
+    "top_k": "Only let the AI pick from its K favourite next letters, so it "
+             "never picks a crazy one. Good value: 40.\n\nTechnically: at each step, sample only from the k most likely next characters. "
              "Reduces bizarre rarities without making the output greedy. "
              "0 disables filtering entirely.",
-    "top_p": "Nucleus sampling: sample only from the smallest set of "
+    "top_p": "Another safety filter: ignore the unlikely long tail of letters. "
+             "Good value: 0.95 (1.0 = off).\n\nTechnically, nucleus sampling: sample only from the smallest set of "
              "characters whose combined probability reaches p. Adapts to "
              "how confident the model is (unlike top-k). 0.9-0.95 is a "
              "good default; 1.0 disables.",
-    "repeat_penalty": "Discourages characters used in the last ~32 "
+    "repeat_penalty": "Stops the AI from repeating itself in loops. Keep it at 1.0 "
+                      "(off) for maths / Q&A.\n\nTechnically: discourages characters used in the last ~32 "
                       "outputs. 1.0 = off. 1.1-1.3 curbs loops in prose; "
                       "leave it OFF for arithmetic / Q&A data, where "
                       "answers legitimately repeat digits.",
-    "max_tokens": "Maximum characters to generate per response. Generation may "
+    "max_tokens": "How long the answer may be, counted in letters. Maximum characters to generate per response. Generation may "
                   "stop earlier at a stop token (newline, in Q&A mode).",
-    "seed": "Controls sampling randomness. Same seed + same prompt + same "
+    "seed": "A number that makes the AI repeat exactly the same answer every "
+            "time (handy for comparing). Leave empty for variety.\n\nTechnically: controls sampling randomness. Same seed + same prompt + same "
             "settings = byte-identical output. Empty = fresh randomness each "
             "time. Click the dice for a new random seed.",
     "qa_mode": "Wraps your input as 'Q: …\\nA:' and stops at the first newline. "
@@ -462,7 +468,8 @@ HELP: dict[str, str] = {
             "every control explained.",
     "reset": "Restore the sampling controls to defaults: temperature=0.7, "
              "top-k=40, top-p=0.95, repeat penalty off, max=200, no seed, no Q&A, no stop-at-newline.",
-    "model": "Full model card: checkpoint path, file size, mtime, parameters, "
+    "model": "Everything about the loaded AI: how big it is and how much training it has had "
+             "(total steps across all sessions).\n\nFull model card: checkpoint path, file size, mtime, parameters, "
              "vocab size, device, and training metadata.",
     "dice": "Generate a random seed. Fill in a specific seed for reproducible "
             "output across runs.",
@@ -976,7 +983,8 @@ class ChatWindow:
                      f"emb={self.ckpt.get('embedding_dim')}, "
                      f"hidden={self.ckpt.get('hidden_size')}, "
                      f"layers={self.ckpt.get('num_layers')}")
-        lines.append(f"Trained: step {self.ckpt.get('step', '?')}, "
+        lines.append(f"Trained: {self.ckpt.get('step', '?')} total steps over "
+                     f"{self.ckpt.get('sessions', 1)} session(s), "
                      f"best val loss {self.ckpt.get('best_validation_loss', float('nan')):.4f}")
         return "\n".join(lines)
 
@@ -1034,7 +1042,8 @@ class ChatWindow:
         step = self.ckpt.get("step", "?")
         bvl = self.ckpt.get("best_validation_loss", float("nan"))
         msg = (
-            f"Model loaded — step {step}, best val loss {bvl:.4f}.\n"
+            f"Model loaded — {step} total training steps over "
+            f"{self.ckpt.get('sessions', 1)} session(s), best val loss {bvl:.4f}.\n"
             "Type a prompt and press Enter. Esc stops generation. "
             "Hover/click any ? for help."
         )
