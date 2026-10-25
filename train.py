@@ -13,10 +13,21 @@ Data can be supplied three ways (they combine):
 
     --data FILE_OR_DIR_OR_GLOB [...]   # files, dirs, or globs
     --data-list MANIFEST.txt           # one path per line (repeatable)
-    (nothing)                          # auto-detect 1.txt..10.txt in CWD
+    (nothing)                          # auto-detect (see below)
+
+Auto-detect, when no data is given, tries in order: ``data_to_train_on/``
+(next to this script, then in the current directory), then 1.txt..10.txt in
+the current directory, then 1.txt..10.txt next to this script.
+
+The checkpoint path is anchored to the folder that holds this script unless
+you pass an absolute path, so train.py and ask.py always agree on where it
+lives no matter which directory you launch them from.
 
 Directories and glob matches are walked recursively, picking up files whose
-extension is in ``--data-ext`` (default ``.txt,.text,.md``). For corpora with
+extension is in ``--data-ext`` (default ``.txt,.text,.md,.json,.jsonl,.pdf``).
+JSON / JSONL files contribute their string values (restrict with
+``--json-keys text,content``); PDFs contribute their text layer (needs
+``pip install pypdf``). For corpora with
 thousands of files prefer ``--data-list`` — it dodges the OS command-line
 length limit entirely.
 
@@ -27,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import codecs
+import contextlib
 import csv
 import glob
 import math
@@ -47,7 +59,16 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from model import CharGRU
+from data_readers import BINARY_SUFFIXES, extract_text
+from model import (
+    CharGRU,
+    EMA,
+    DEFAULT_CHECKPOINT_NAME,
+    DEFAULT_DATA_DIRNAME,
+    PROJECT_DIR,
+    atomic_torch_save,
+    resolve_checkpoint_path,
+)
 
 try:
     import numpy as _np
@@ -75,7 +96,8 @@ BASE_CHARACTERS = (
 )
 LOG_COLUMNS = ["run_id", "step", "elapsed", "train_loss", "val_loss",
                "lr", "grad_norm", "tokens_per_sec"]
-DEFAULT_DATA_EXTS = (".txt", ".text", ".md")
+DEFAULT_DATA_EXTS = (".txt", ".text", ".md", ".json", ".jsonl", ".pdf")
+DEFAULT_DATA_EXTS_STR = ",".join(DEFAULT_DATA_EXTS)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -162,6 +184,14 @@ def _maybe_launch_chat(checkpoint: Path) -> None:
         print("Chat window opened. Close it when you're done.")
     except Exception as exc:
         print(f"(Could not open chat window: {exc})")
+
+
+def _shell_join(cmd: list[str]) -> str:
+    """Quote a command line for display so it can be pasted into a shell."""
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(cmd)
+    import shlex
+    return shlex.join(cmd)
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -305,6 +335,7 @@ def load_corpus(
     errors: str = "replace",
     separator: str = "\n\n",
     verbose: bool = True,
+    json_keys: list[str] | None = None,
 ) -> tuple[str, dict[str, int], int]:
     """Read every file; return ``(joined_text, char_counts, replacements)``.
 
@@ -329,11 +360,14 @@ def load_corpus(
             continue
         total_bytes += len(raw)
         try:
-            text = raw.decode(encoding, errors=errors)
-        except (LookupError, UnicodeError) as exc:
+            # .txt/.md decode as text; .json/.jsonl yield their string
+            # values; .pdf yields its text layer (see data_readers.py).
+            text = extract_text(path, raw, encoding, errors, json_keys)
+        except (LookupError, UnicodeError, ValueError, RuntimeError,
+                ImportError) as exc:
             unreadable.append((path, str(exc)))
             continue
-        if "\ufffd" in text:
+        if "\ufffd" in text and path.suffix.lower() not in BINARY_SUFFIXES:
             replacements += text.count("\ufffd")
         text = text.strip()
         if not text:
@@ -361,6 +395,9 @@ def load_corpus(
             print(f"  … and {len(unreadable) - 5} more")
     if empty:
         print(f"note: {len(empty)} file(s) were empty after stripping.")
+        if any(p.suffix.lower() == ".pdf" for p in empty):
+            print("  (a PDF with no text is usually a scan — run OCR first, "
+                  "e.g. `ocrmypdf in.pdf out.pdf`)")
     if replacements:
         print(f"warning: {replacements:,} byte(s) undecodable as {encoding!r} "
               f"→ U+FFFD. Use --data-encoding to change the codec.")
@@ -383,6 +420,33 @@ def encode_text(text: str, stoi: dict[str, int]) -> torch.Tensor:
     return torch.tensor(list(map(stoi.__getitem__, text)), dtype=torch.long)
 
 
+def _default_data_specs(extensions: tuple[str, ...]) -> list[str]:
+    """Find training data when the user passed none.
+
+    Order: ``data_to_train_on/`` (script dir, then CWD), then ``1.txt..10.txt``
+    in the CWD, then next to this script. The first location that actually
+    contains matching files wins; the choice is printed so it is never magic.
+    """
+    cwd = Path.cwd()
+    folders = [PROJECT_DIR / DEFAULT_DATA_DIRNAME, cwd / DEFAULT_DATA_DIRNAME]
+    seen: set[Path] = set()
+    for folder in folders:
+        if folder in seen or not folder.is_dir():
+            continue
+        seen.add(folder)
+        if _walk_files(folder, extensions):
+            print(f"No --data given: using folder {folder}")
+            return [str(folder)]
+    for base in (cwd, PROJECT_DIR):
+        numbered = [str(base / f"{i}.txt") for i in range(1, 11)
+                    if (base / f"{i}.txt").is_file()]
+        if numbered:
+            print(f"No --data given: using {len(numbered)} numbered file(s) "
+                  f"in {base}")
+            return numbered
+    return []
+
+
 # ─────────────────────────────────────────────────────────────────────────
 #  Argument validation
 # ─────────────────────────────────────────────────────────────────────────
@@ -396,6 +460,14 @@ def _validate_training_args(args: argparse.Namespace) -> None:
         raise SystemExit("error: --block-size must be >= 8")
     if args.grad_accum < 1:
         raise SystemExit("error: --grad-accum must be >= 1")
+    for name in ("eval_interval", "log_interval", "eval_batches",
+                 "embedding_dim", "hidden_size", "num_layers"):
+        if getattr(args, name) < 1:
+            raise SystemExit(
+                f"error: --{name.replace('_', '-')} must be >= 1")
+    if args.patience < 0 or args.sample_every < 0 or args.warmup_steps < 0:
+        raise SystemExit(
+            "error: --patience, --sample-every and --warmup-steps must be >= 0")
     if args.learning_rate <= 0:
         raise SystemExit("error: --learning-rate must be > 0")
     if not (0.0 <= args.min_lr_ratio <= 1.0):
@@ -411,6 +483,11 @@ def _validate_training_args(args: argparse.Namespace) -> None:
     if args.tie_weights and args.embedding_dim != args.hidden_size:
         raise SystemExit("error: --tie-weights requires "
                          "--embedding-dim == --hidden-size")
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise SystemExit("error: --ema-decay must be in [0, 1) "
+                         "(0 disables weight averaging)")
+    if args.grad_clip < 0:
+        raise SystemExit("error: --grad-clip must be >= 0 (0 disables)")
 
     # Data-specific validation
     try:
@@ -433,6 +510,11 @@ def _validate_training_args(args: argparse.Namespace) -> None:
 def run_training(args: argparse.Namespace) -> int:
     _validate_training_args(args)
 
+    # Anchor the checkpoint to the project folder (not the shell's CWD) so
+    # ask.py can always find it. See model.resolve_checkpoint_path.
+    args.checkpoint = str(resolve_checkpoint_path(args.checkpoint))
+    print(f"Checkpoint will be saved to: {args.checkpoint}")
+
     # ── 1. Resolve specs → concrete file list ────────────────────────
     extensions = _parse_extensions(args.data_ext)
 
@@ -441,15 +523,17 @@ def run_training(args: argparse.Namespace) -> int:
         specs.extend(read_data_manifest(Path(manifest)))
 
     if not specs:
-        # Backwards compat: auto-detect 1.txt..10.txt in CWD.
-        specs = [f"{i}.txt" for i in range(1, 11) if Path(f"{i}.txt").exists()]
+        specs = _default_data_specs(extensions)
         if not specs:
             raise SystemExit(
-                "error: no data supplied. Use --data, --data-list, or place "
-                "1.txt..10.txt in the working directory.")
+                "error: no training data found.\n"
+                f"  Looked in: {PROJECT_DIR / DEFAULT_DATA_DIRNAME}, "
+                f"{Path.cwd() / DEFAULT_DATA_DIRNAME}, and for 1.txt..10.txt "
+                "in the current and script directories.\n"
+                f"  Fix: python train.py --cli --data {DEFAULT_DATA_DIRNAME}")
 
     print(f"Resolving {len(specs):,} data spec(s) "
-          f"(extensions: {', '.join(extensions) or 'any'})…")
+          f"(extensions: {', '.join(extensions) or 'any/'})…")
     files = expand_data_specs(specs, extensions)
     if not files:
         raise SystemExit("error: data specs resolved to zero files.")
@@ -465,6 +549,8 @@ def run_training(args: argparse.Namespace) -> int:
     print("Reading corpus…")
     all_text, char_counts, _ = load_corpus(
         files, encoding=args.data_encoding, errors=args.data_errors,
+        json_keys=[k for k in args.json_keys.split(",") if k.strip()]
+        if args.json_keys else None,
     )
     if len(all_text) < 10000:
         raise SystemExit(
@@ -503,8 +589,11 @@ def run_training(args: argparse.Namespace) -> int:
     amp_dtype = (torch.bfloat16
                  if use_amp and torch.cuda.is_bf16_supported()
                  else torch.float16)
-    scaler = torch.cuda.amp.GradScaler(
-        enabled=use_amp and amp_dtype == torch.float16)
+    _scaler_on = use_amp and amp_dtype == torch.float16
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=_scaler_on)
+    except (AttributeError, TypeError):  # torch < 2.3
+        scaler = torch.cuda.amp.GradScaler(enabled=_scaler_on)
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
 
@@ -545,17 +634,30 @@ def run_training(args: argparse.Namespace) -> int:
         return min_lr + 0.5 * (args.learning_rate - min_lr) * \
                (1 + math.cos(math.pi * min(1.0, progress)))
 
+    # Weight averaging: evaluation, samples and checkpoints all use the
+    # smoothed weights, which are almost always better than the raw ones.
+    ema = EMA(model, args.ema_decay) if args.ema_decay > 0 else None
+    if ema is not None:
+        print(f"Weight averaging (EMA) on, decay {args.ema_decay} — "
+              f"validation, samples and checkpoints use averaged weights.")
+
+    def averaged():
+        return ema.average_weights(model) if ema is not None \
+            else contextlib.nullcontext()
+
     @torch.no_grad()
     def eval_loss(data: torch.Tensor) -> float:
         model.eval()
         total = 0.0
         try:
-            for _ in range(args.eval_batches):
-                x, y = get_batch(data, args.batch_size, args.block_size)
-                with autocast():
-                    logits = model(x)
-                total += F.cross_entropy(
-                    logits.float().reshape(-1, vocab), y.reshape(-1)).item()
+            with averaged():
+                for _ in range(args.eval_batches):
+                    x, y = get_batch(data, args.batch_size, args.block_size)
+                    with autocast():
+                        logits = model(x)
+                    total += F.cross_entropy(
+                        logits.float().reshape(-1, vocab),
+                        y.reshape(-1)).item()
         finally:
             model.train()
         return total / max(1, args.eval_batches)
@@ -566,8 +668,10 @@ def run_training(args: argparse.Namespace) -> int:
             return
         start = int(torch.randint(0, val_data.numel() - 64, (1,)))
         prompt = val_data[start:start + 64][None, :]
-        out = model.generate(prompt, max_new_tokens=200,
-                             temperature=0.8, top_k=40)[0].tolist()
+        with averaged():
+            out = model.generate(prompt, max_new_tokens=200, temperature=0.8,
+                                 top_k=40, top_p=0.95)[0].tolist()
+        model.train()
         text = "".join(itos[i] for i in out)
         print("  --- sample (prompt | generated) ---")
         print("  " + (text[:64] + " | " + text[64:]).replace("\n", "\n  "))
@@ -576,9 +680,32 @@ def run_training(args: argparse.Namespace) -> int:
     log_path = Path(args.log)
     handle, writer = prepare_log(log_path)
     Path(args.checkpoint).parent.mkdir(parents=True, exist_ok=True)
+
+    def save_checkpoint(step_no: int, val_loss: float) -> None:
+        """Atomic write — a crash mid-save can't corrupt the last good file."""
+        with averaged():
+            weights = {k: t.detach().cpu().clone()
+                       for k, t in model.state_dict().items()}
+        atomic_torch_save(
+            {
+                "model_state_dict": weights,
+                "ema_decay": args.ema_decay,
+                "characters": itos,
+                "block_size": args.block_size,
+                "embedding_dim": args.embedding_dim,
+                "hidden_size": args.hidden_size,
+                "num_layers": args.num_layers,
+                "dropout": args.dropout,
+                "tie_weights": args.tie_weights,
+                "best_validation_loss": val_loss,
+                "step": step_no,
+            },
+            args.checkpoint)
+
     viewer = None if args.no_live else launch_live_plot(log_path, args.run_id)
 
     best_val, bad_evals, eval_count = math.inf, 0, 0
+    completed_steps = 0
     run_loss = torch.zeros((), device=device)
     run_n = 0
     t_start = t_last = time.time()
@@ -591,7 +718,7 @@ def run_training(args: argparse.Namespace) -> int:
                 group["lr"] = lr
 
             optimizer.zero_grad(set_to_none=True)
-            step_loss_val = 0.0
+            step_loss = torch.zeros((), device=device)
             for _micro in range(args.grad_accum):
                 x, y = get_batch(train_data, args.batch_size, args.block_size)
                 with autocast():
@@ -599,17 +726,22 @@ def run_training(args: argparse.Namespace) -> int:
                 loss = F.cross_entropy(
                     logits.float().reshape(-1, vocab), y.reshape(-1),
                     label_smoothing=args.label_smoothing)
-                step_loss_val += loss.item() / args.grad_accum
+                # .detach() accumulation: no .item() → no CPU/GPU sync here.
+                step_loss += loss.detach() / args.grad_accum
                 scaler.scale(loss / args.grad_accum).backward()
 
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=1.0)
+                model.parameters(),
+                max_norm=args.grad_clip if args.grad_clip > 0 else math.inf)
             scaler.step(optimizer)
             scaler.update()
+            if ema is not None:
+                ema.update(model)
 
-            run_loss += step_loss_val
+            run_loss += step_loss
             run_n += 1
+            completed_steps = step
 
             do_eval = step % args.eval_interval == 0 or step == args.steps
             if step % args.log_interval == 0 or do_eval or step == 1:
@@ -630,23 +762,7 @@ def run_training(args: argparse.Namespace) -> int:
                     )
                     if v < best_val:
                         best_val, bad_evals = v, 0
-                        torch.save(
-                            {
-                                "model_state_dict": {
-                                    k: t.detach().cpu()
-                                    for k, t in model.state_dict().items()
-                                },
-                                "characters": itos,
-                                "block_size": args.block_size,
-                                "embedding_dim": args.embedding_dim,
-                                "hidden_size": args.hidden_size,
-                                "num_layers": args.num_layers,
-                                "dropout": args.dropout,
-                                "tie_weights": args.tie_weights,
-                                "best_validation_loss": best_val,
-                                "step": step,
-                            },
-                            args.checkpoint)
+                        save_checkpoint(step, best_val)
                         print(f"  saved best checkpoint (val {best_val:.4f})")
                     else:
                         bad_evals += 1
@@ -665,9 +781,22 @@ def run_training(args: argparse.Namespace) -> int:
                           f"{bad_evals} evals.")
                     break
     except KeyboardInterrupt:
-        print("\nInterrupted — the best checkpoint so far is already saved.")
+        print("\nInterrupted — wrapping up…")
     finally:
         handle.close()
+
+    # Stopped (Ctrl+C / GUI Stop) before the first validation eval? Then no
+    # checkpoint exists yet and ask.py would report "checkpoint not found".
+    # Evaluate once and save what we have so the run is never wasted.
+    if best_val == math.inf and completed_steps > 0:
+        try:
+            v = eval_loss(val_data)
+            best_val = v
+            save_checkpoint(completed_steps, v)
+            print(f"  saved checkpoint at step {completed_steps} "
+                  f"(val {v:.4f}) — stopped before the first scheduled eval")
+        except KeyboardInterrupt:
+            print("  second interrupt — no checkpoint written.")
 
     if best_val < math.inf:
         print(f"Training finished. Best validation loss: {best_val:.4f} "
@@ -710,13 +839,13 @@ GUI_SANS = ("TkDefaultFont", 10)
 HELP: dict[str, str] = {
     "data": "Files, folders, or glob patterns. Directories and glob "
             "matches are walked recursively, picking up files whose "
-            "extension is in --data-ext (.txt, .text, .md by default). "
+            "extension is in --data-ext (.txt .text .md .json .jsonl .pdf by default). "
             "Add as many specs as you like — 'Add folder…' stores a single "
             "directory spec, so 20 000 files fit in one entry. Empty = "
             "auto-detect 1.txt..10.txt in the working directory.",
     "browse_dir": "Add a directory. Directories are stored as a single "
                   "spec and expanded recursively by the loader using "
-                  "--data-ext (.txt, .text, .md by default). Add as many "
+                  "--data-ext (.txt .text .md .json .jsonl .pdf by default). Add as many "
                   "folders as you like — the loader handles thousands of "
                   "files without hitting command-line length limits.",
     "checkpoint": "Where the best model is saved. Overwritten each time "
@@ -766,6 +895,23 @@ HELP: dict[str, str] = {
                  "finishes.",
     "live_dashboard": "Open the live matplotlib dashboard in a separate "
                       "process. Closing it does NOT stop training.",
+    "ema_decay": "Exponential moving average of the weights. The averaged "
+                 "model is what gets validated and saved — it is usually "
+                 "noticeably better than the raw weights at zero extra "
+                 "cost. 0.999 suits 5k+ steps; use 0.99 for short runs; "
+                 "0 disables.",
+    "grad_clip": "Maximum gradient norm (global clipping). 1.0 is a safe "
+                 "default; lower it if the 'Gradient norm' plot shows "
+                 "spikes. 0 disables clipping.",
+    "json_keys": "Only for .json / .jsonl training files. Comma-separated "
+                 "keys whose text to learn from, e.g. 'text,content'. "
+                 "Empty = every string value in the file. Use it to skip "
+                 "ids, urls and labels.",
+    "preset": "One-click starting points. They only fill in the fields "
+              "below — review or tweak anything before pressing Start.",
+    "open_dashboard": "Open the live plots window for this run (also "
+                      "works after training, for the saved log).",
+    "open_chat": "Open the chat window with the current checkpoint.",
     "tie": "Share input embedding and output projection weights. Needs "
            "embedding_dim == hidden_size. Regularises & saves parameters — "
            "a good choice for small models.",
@@ -900,6 +1046,42 @@ def launch_training_gui(defaults: dict) -> None:
     root.mainloop()
 
 
+PRESETS: dict[str, dict] = {
+    "Balanced (default)": dict(
+        steps=20000, batch_size=128, block_size=256, hidden_size=512,
+        embedding_dim=64, num_layers=2, dropout=0.1, learning_rate=0.002,
+        warmup_steps=200, weight_decay=0.01, label_smoothing=0.0,
+        eval_interval=250, ema_decay=0.999, grad_clip=1.0),
+    "Quick test (minutes)": dict(
+        steps=1500, batch_size=64, block_size=128, hidden_size=256,
+        embedding_dim=64, num_layers=2, dropout=0.1, learning_rate=0.003,
+        warmup_steps=50, weight_decay=0.01, label_smoothing=0.0,
+        eval_interval=100, ema_decay=0.99, grad_clip=1.0),
+    "CPU friendly": dict(
+        steps=8000, batch_size=32, block_size=128, hidden_size=256,
+        embedding_dim=64, num_layers=2, dropout=0.1, learning_rate=0.003,
+        warmup_steps=100, weight_decay=0.01, label_smoothing=0.0,
+        eval_interval=200, ema_decay=0.998, grad_clip=1.0),
+    "High quality (GPU)": dict(
+        steps=40000, batch_size=128, block_size=384, hidden_size=768,
+        embedding_dim=96, num_layers=3, dropout=0.15, learning_rate=0.0015,
+        warmup_steps=400, weight_decay=0.05, label_smoothing=0.05,
+        eval_interval=500, ema_decay=0.9995, grad_clip=1.0),
+}
+
+_STEP_LINE = re.compile(
+    r"^\s*step\s+(\d+)\s+\|\s+train\s+([\d.]+)\s+\|\s+val\s+([\d.]+)\s+\|"
+    r"\s+ppl\s+(\S+)\s+\|\s+lr\s+(\S+)\s+\|\s+([\d,]+)\s+chars/s")
+
+
+def _fmt_num(v: float) -> str:
+    """Compact human number: 1234 -> 1.23k, 2.5e6 -> 2.5M."""
+    for div, suf in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if abs(v) >= div:
+            return f"{v / div:.3g}{suf}"
+    return f"{v:.3g}"
+
+
 class TrainingLauncher:
     def __init__(self, root, defaults: dict):
         import tkinter as tk
@@ -912,6 +1094,10 @@ class TrainingLauncher:
         self.total_steps = int(defaults.get("steps", 20000))
         self.train_start_ts: float | None = None
         self._temp_manifest: Path | None = None
+        self.run_id: str | None = None
+        self._last_csv_poll = 0.0
+        self._best_val = math.inf
+        self._prev_val = math.inf
 
         self._apply_theme()
         self._build()
@@ -921,9 +1107,11 @@ class TrainingLauncher:
     def _apply_theme(self):
         tk, ttk = self.tk, self.ttk
         self.root.configure(bg=GUI_BG)
-        self.root.title("Tiny Text AI — Train")
-        self.root.geometry("1020x860")
-        self.root.minsize(820, 620)
+        self.root.title("Ai-Trainer---chatter")
+        _h = min(880, max(640, self.root.winfo_screenheight() - 90))
+        _w = min(1360, max(1120, self.root.winfo_screenwidth() - 40))
+        self.root.geometry(f"{_w}x{_h}")
+        self.root.minsize(1100, 620)
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -959,6 +1147,9 @@ class TrainingLauncher:
                   foreground=[("disabled", GUI_DIM)])
         style.configure("Danger.TButton", background=GUI_PANEL2,
                         foreground=GUI_ERR, borderwidth=0, padding=(10, 6))
+        style.configure("TScrollbar", background=GUI_PANEL2,
+                        troughcolor=GUI_BG, bordercolor=GUI_BG,
+                        arrowcolor=GUI_DIM, borderwidth=0)
         style.configure("TProgressbar", background=GUI_ACCENT,
                         troughcolor=GUI_PANEL, borderwidth=0,
                         lightcolor=GUI_ACCENT, darkcolor=GUI_ACCENT)
@@ -973,19 +1164,82 @@ class TrainingLauncher:
         tk.Label(header, text="◆  Training Launcher", bg=GUI_PANEL,
                  fg=GUI_ACCENT, font=(GUI_SANS[0], 12, "bold"),
                  padx=16).pack(side=tk.LEFT, pady=14)
+        tk.Label(header, text="character-level GRU  ·  EMA-averaged weights",
+                 bg=GUI_PANEL, fg=GUI_DIM, font=(GUI_SANS[0], 9),
+                 padx=16).pack(side=tk.RIGHT)
+        tk.Frame(self.root, bg=GUI_BORDER, height=1).pack(fill=tk.X)
 
-        canvas = tk.Canvas(self.root, bg=GUI_BG, highlightthickness=0)
-        scroll = ttk.Scrollbar(self.root, orient="vertical",
-                               command=canvas.yview)
+        body = tk.Frame(self.root, bg=GUI_BG)
+        body.pack(fill=tk.BOTH, expand=True)
+        left = tk.Frame(body, bg=GUI_BG, width=640)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
+        tk.Frame(body, bg=GUI_BORDER, width=1).pack(side=tk.LEFT, fill=tk.Y)
+        right = tk.Frame(body, bg=GUI_BG)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Action bar pinned to the bottom of the settings pane so Start/Stop
+        # are always visible no matter how far the form is scrolled.
+        bar = tk.Frame(left, bg=GUI_PANEL)
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Frame(bar, bg=GUI_BORDER, height=1).pack(fill=tk.X)
+        ctrl = tk.Frame(bar, bg=GUI_PANEL)
+        ctrl.pack(fill=tk.X, padx=16, pady=10)
+
+        # Preset bar
+        pbar = tk.Frame(left, bg=GUI_BG)
+        pbar.pack(side=tk.TOP, fill=tk.X, padx=16, pady=(12, 0))
+        tk.Label(pbar, text="Preset", bg=GUI_BG, fg=GUI_TEXT).pack(
+            side=tk.LEFT)
+        _help_badge(pbar, "preset").pack(side=tk.LEFT, padx=(2, 10))
+        self.preset_var = tk.StringVar(value="Select a preset…")
+        preset_combo = ttk.Combobox(
+            pbar, textvariable=self.preset_var, values=list(PRESETS),
+            state="readonly", width=26)
+        preset_combo.pack(side=tk.LEFT)
+        preset_combo.bind("<<ComboboxSelected>>",
+                          lambda _e: self._apply_preset())
+
+        canvas = tk.Canvas(left, bg=GUI_BG, highlightthickness=0)
+        scroll = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
         form = tk.Frame(canvas, bg=GUI_BG)
         form.bind("<Configure>",
                   lambda _e: canvas.configure(
                       scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=form, anchor="nw")
+        win = canvas.create_window((0, 0), window=form, anchor="nw")
+        # Make the form track the canvas width so wide entries stretch.
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(win, width=e.width))
         canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=16, pady=12)
-        scroll.place(in_=canvas, relx=1.0, rely=0.0, relheight=1.0,
-                     anchor="ne")
+        scroll.pack(side=tk.RIGHT, fill=tk.Y, pady=8)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                    padx=(16, 4), pady=8)
+
+        def _wheel(event):
+            if getattr(event, "num", 0) == 4:
+                canvas.yview_scroll(-3, "units")
+            elif getattr(event, "num", 0) == 5:
+                canvas.yview_scroll(3, "units")
+            else:
+                canvas.yview_scroll(int(-event.delta / 40) or
+                                    (-1 if event.delta > 0 else 1), "units")
+
+        def _over_canvas(event):
+            try:
+                w = self.root.winfo_containing(event.x_root, event.y_root)
+            except (KeyError, self.tk.TclError):  # combobox popdown quirk
+                return False
+            while w is not None:
+                if w is canvas:
+                    return True
+                w = getattr(w, "master", None)
+            return False
+
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.root.bind_all(
+                seq, lambda e: _wheel(e) if _over_canvas(e) else None,
+                add="+")
+        self.root.bind("<Control-Return>", lambda _e: self._start())
 
         self.vars: dict[str, tk.StringVar] = {}
 
@@ -1056,7 +1310,7 @@ class TrainingLauncher:
         clear_btn.pack(side=tk.LEFT)
         Tooltip(clear_btn, HELP["clear_data"], clickable=False)
 
-        field(form, 3, "Checkpoint", "checkpoint", "tiny_text_model.pt",
+        field(form, 3, "Checkpoint", "checkpoint", DEFAULT_CHECKPOINT_NAME,
               width=62, col=0, colspan=3, padx=(0, 0))
         field(form, 4, "Log file", "log", "training_log.csv",
               width=62, col=0, colspan=3, padx=(0, 0))
@@ -1122,13 +1376,17 @@ class TrainingLauncher:
             row=17, column=0, columnspan=6, sticky="w", pady=(16, 6))
         pair(form, 18, "Sample every", "sample_every", 4,
              "Patience", "patience", 0)
+        pair(form, 19, "EMA decay", "ema_decay", 0.999,
+             "Grad clip", "grad_clip", 1.0)
+        field(form, 20, "JSON keys", "json_keys", "", width=34, col=0,
+              colspan=3, padx=(0, 0))
 
         # ── OPTIONS ──────────────────────────────────────────────
         ttk.Label(form, text="OPTIONS", style="Section.TLabel").grid(
-            row=19, column=0, columnspan=6, sticky="w", pady=(16, 6))
+            row=21, column=0, columnspan=6, sticky="w", pady=(16, 6))
 
         opt_row = tk.Frame(form, bg=GUI_BG)
-        opt_row.grid(row=20, column=0, columnspan=6, sticky="w", pady=4)
+        opt_row.grid(row=22, column=0, columnspan=6, sticky="w", pady=4)
 
         def opt(parent, text, var, key, padx=(0, 4)):
             cb = ttk.Checkbutton(parent, text=text, variable=var)
@@ -1153,9 +1411,7 @@ class TrainingLauncher:
             padx=(0, 4))
 
         # ── CONTROLS ─────────────────────────────────────────────
-        ctrl = tk.Frame(form, bg=GUI_BG)
-        ctrl.grid(row=21, column=0, columnspan=6, sticky="ew",
-                  pady=(18, 4))
+        self._ctrl = ctrl
         self.start_btn = ttk.Button(ctrl, text="▶  Start training",
                                     style="Accent.TButton",
                                     command=self._start)
@@ -1171,53 +1427,213 @@ class TrainingLauncher:
         _help_badge(ctrl, "stop").pack(side=tk.LEFT, padx=(4, 20))
         Tooltip(self.stop_btn, HELP["stop"], clickable=False)
 
-        help_btn = ttk.Button(ctrl, text="?  Full help",
+        help_btn = ttk.Button(ctrl, text="?  Help",
                               command=self._show_help)
         help_btn.pack(side=tk.RIGHT)
         Tooltip(help_btn, HELP["help"], clickable=False)
+        chat_btn = ttk.Button(ctrl, text="Chat", command=self._open_chat)
+        chat_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        Tooltip(chat_btn, HELP["open_chat"], clickable=False)
+        dash_btn = ttk.Button(ctrl, text="Dashboard",
+                              command=self._open_dashboard)
+        dash_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        Tooltip(dash_btn, HELP["open_dashboard"], clickable=False)
 
-        # ── PROGRESS ─────────────────────────────────────────────
-        self.progress = ttk.Progressbar(form, mode="determinate",
-                                        maximum=100)
-        self.progress.grid(row=22, column=0, columnspan=6, sticky="ew",
-                           pady=(6, 4))
-        self.status_label = ttk.Label(form, text="Idle", style="Dim.TLabel")
-        self.status_label.grid(row=23, column=0, columnspan=6, sticky="w")
+        self._build_monitor(right)
+        form.columnconfigure(5, weight=1)
 
-        # ── LOG ──────────────────────────────────────────────────
-        ttk.Label(form, text="TRAINING LOG", style="Section.TLabel").grid(
-            row=24, column=0, columnspan=6, sticky="w", pady=(16, 6))
-        log_frame = tk.Frame(form, bg=GUI_PANEL, highlightthickness=1,
+    # ── live monitor (right pane) ────────────────────────────────────
+    def _build_monitor(self, parent):
+        tk, ttk = self.tk, self.ttk
+        wrap = tk.Frame(parent, bg=GUI_BG)
+        wrap.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+        ttk.Label(wrap, text="LIVE METRICS", style="Section.TLabel").pack(
+            anchor="w", pady=(4, 6))
+
+        grid = tk.Frame(wrap, bg=GUI_BG)
+        grid.pack(fill=tk.X)
+        self.cards: dict[str, tk.Label] = {}
+        specs = [("step", "STEP"), ("train", "TRAIN LOSS"),
+                 ("val", "VAL LOSS"), ("best", "BEST VAL"),
+                 ("ppl", "PERPLEXITY"), ("bpc", "BITS / CHAR"),
+                 ("lr", "LEARNING RATE"), ("speed", "CHARS / SEC")]
+        for i, (key, title) in enumerate(specs):
+            card = tk.Frame(grid, bg=GUI_PANEL, highlightthickness=1,
+                            highlightbackground=GUI_BORDER)
+            card.grid(row=i // 4, column=i % 4, sticky="nsew", padx=4, pady=4)
+            tk.Label(card, text=title, bg=GUI_PANEL, fg=GUI_DIM,
+                     font=(GUI_SANS[0], 8, "bold")).pack(
+                anchor="w", padx=12, pady=(10, 0))
+            val = tk.Label(card, text="—", bg=GUI_PANEL, fg=GUI_TEXT,
+                           font=(GUI_SANS[0], 16, "bold"))
+            val.pack(anchor="w", padx=12, pady=(0, 10))
+            self.cards[key] = val
+        for c in range(4):
+            grid.columnconfigure(c, weight=1, uniform="card")
+
+        self.progress = ttk.Progressbar(wrap, mode="determinate", maximum=100)
+        self.progress.pack(fill=tk.X, pady=(14, 4))
+        self.status_label = ttk.Label(wrap, text="Idle", style="Dim.TLabel")
+        self.status_label.pack(anchor="w")
+
+        ttk.Label(wrap, text="TRAINING LOG", style="Section.TLabel").pack(
+            anchor="w", pady=(16, 6))
+        log_frame = tk.Frame(wrap, bg=GUI_PANEL, highlightthickness=1,
                              highlightbackground=GUI_BORDER)
-        log_frame.grid(row=25, column=0, columnspan=6, sticky="nsew",
-                       pady=(0, 12))
-        form.rowconfigure(25, weight=1)
+        log_frame.pack(fill=tk.BOTH, expand=True)
         self.log_text = tk.Text(log_frame, bg=GUI_PANEL, fg=GUI_TEXT,
                                 font=GUI_MONO, relief=tk.FLAT, wrap=tk.NONE,
-                                height=16, state=tk.DISABLED, padx=10,
-                                pady=8)
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                                state=tk.DISABLED, padx=10, pady=8)
         log_scroll = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        form.columnconfigure(5, weight=1)
+        xscroll = ttk.Scrollbar(log_frame, orient="horizontal",
+                                command=self.log_text.xview)
+        xscroll.pack(side=tk.BOTTOM, fill=tk.X)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.log_text.configure(yscrollcommand=log_scroll.set,
+                                xscrollcommand=xscroll.set)
+        for tag, color in (("cmd", GUI_DIM), ("err", GUI_ERR),
+                           ("warn", "#fbbf24"), ("ok", "#86efac"),
+                           ("metric", GUI_ACCENT)):
+            self.log_text.tag_configure(tag, foreground=color)
+
+    def _reset_cards(self):
+        for lbl in self.cards.values():
+            lbl.configure(text="—", fg=GUI_TEXT)
+        self._best_val = math.inf
+        self._prev_val = math.inf
+
+    def _update_metrics(self, line: str):
+        m = _STEP_LINE.match(line)
+        if not m:
+            return
+        step, train, val, ppl, lr, tps = m.groups()
+        try:
+            v = float(val)
+        except ValueError:
+            return
+        self.cards["step"].configure(text=f"{int(step):,}")
+        self.cards["train"].configure(text=train)
+        improved = v < self._prev_val
+        self.cards["val"].configure(
+            text=val, fg="#86efac" if improved else "#fbbf24")
+        self._prev_val = v
+        if v < self._best_val:
+            self._best_val = v
+        self.cards["best"].configure(text=f"{self._best_val:.4f}",
+                                     fg=GUI_ACCENT)
+        self.cards["ppl"].configure(text=ppl)
+        self.cards["bpc"].configure(text=f"{v / math.log(2):.3f}")
+        self.cards["lr"].configure(text=lr)
+        self.cards["speed"].configure(text=tps)
+
+    def _log_file(self) -> Path:
+        p = Path(self.vars["log"].get().strip() or "training_log.csv")
+        p = p.expanduser()
+        return p if p.is_absolute() else Path(__file__).resolve().parent / p
+
+    def _poll_csv(self):
+        """Smooth progress: read the newest CSV row (written every
+        ``--log-interval`` steps) instead of waiting for the next eval."""
+        now = time.time()
+        if self.run_id is None or now - self._last_csv_poll < 1.0:
+            return
+        self._last_csv_poll = now
+        try:
+            path = self._log_file()
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 4096))
+                tail = f.read().decode("utf-8", errors="replace")
+            for row in reversed(tail.splitlines()):
+                parts = row.split(",")
+                if len(parts) >= 8 and parts[0] == self.run_id:
+                    step = int(parts[1])
+                    self._set_progress(step)
+                    self.cards["step"].configure(text=f"{step:,}")
+                    if parts[3]:
+                        self.cards["train"].configure(text=parts[3])
+                    if parts[5]:
+                        self.cards["lr"].configure(text=parts[5])
+                    if parts[7]:
+                        self.cards["speed"].configure(
+                            text=_fmt_num(float(parts[7])))
+                    break
+        except (OSError, ValueError, IndexError):
+            pass
+
+    def _set_progress(self, step: int):
+        if self.total_steps <= 0:
+            return
+        pct = min(100.0, 100.0 * step / self.total_steps)
+        self.progress["value"] = pct
+        elapsed = (time.time() - self.train_start_ts
+                   if self.train_start_ts else 0.0)
+        rate = step / elapsed if elapsed > 0 else 0.0
+        remaining = ((self.total_steps - step) / rate
+                     if rate > 0 else float("inf"))
+        self.status_label.configure(
+            text=f"Step {step:,}/{self.total_steps:,}  ·  {pct:.1f}%  ·  "
+                 f"elapsed {_fmt_hms(elapsed)}  ·  ETA {_fmt_hms(remaining)}")
+        try:
+            self.root.title(f"Ai-Trainer---chatter — {pct:.0f}%")
+        except Exception:
+            pass
+
+    def _apply_preset(self):
+        preset = PRESETS.get(self.preset_var.get())
+        if not preset or self.proc is not None:
+            return
+        for key, value in preset.items():
+            if key in self.vars:
+                self.vars[key].set(str(value))
+        if self.opt_tie.get() and preset["embedding_dim"] != \
+                preset["hidden_size"]:
+            self.opt_tie.set(False)
+        self.status_label.configure(
+            text=f"Preset '{self.preset_var.get()}' applied — review, then "
+                 f"press Start (Ctrl+Enter).")
+
+    def _open_dashboard(self):
+        script = Path(__file__).resolve().with_name("plot_results.py")
+        cmd = [sys.executable, str(script), "--live",
+               "--log", str(self._log_file())]
+        if self.run_id and self.proc is not None:
+            cmd += ["--run-id", self.run_id]
+        try:
+            subprocess.Popen(cmd)
+        except Exception as exc:
+            self._append_log(f"[could not open dashboard: {exc}]\n")
+
+    def _open_chat(self):
+        script = Path(__file__).resolve().with_name("ask.py")
+        ckpt = resolve_checkpoint_path(
+            self.vars["checkpoint"].get().strip() or None)
+        try:
+            subprocess.Popen([sys.executable, str(script), "--gui",
+                              "--checkpoint", str(ckpt)])
+        except Exception as exc:
+            self._append_log(f"[could not open chat: {exc}]\n")
 
     # ── data-file list helpers ───────────────────────────────────────
     def _parse_data_paths(self, text: str) -> list[str]:
         """Turn the data entry text into a list of paths.
 
-        Prefers Tcl ``splitlist`` (handles ``{braced paths}`` and
-        ``"quoted paths"``), falls back to ``shlex`` for hand-typed
-        text, and finally to a naive split.
+        1. The whole text is itself an existing path (typed or pasted, with
+           spaces or Windows backslashes) -> exactly that one path.
+        2. Tcl ``splitlist`` (handles ``{braced paths}`` / ``"quoted"``).
+        3. ``shlex`` for hand-typed text, then a naive split.
         """
         text = (text or "").strip()
         if not text:
             return []
+        bare = text.strip("\"'")
+        if bare and os.path.exists(os.path.expanduser(bare)):
+            return [os.path.expanduser(bare)]
         try:
-            parsed = list(self.root.tk.splitlist(text))
-            cleaned = [p for p in parsed if p]
-            if cleaned:
-                return cleaned
+            parsed = [str(p) for p in self.root.tk.splitlist(text) if p]
+            if parsed:
+                return parsed
         except Exception:
             pass
         try:
@@ -1227,17 +1643,26 @@ class TrainingLauncher:
             return [p for p in text.split() if p]
 
     def _set_data_paths(self, paths: list[str]) -> None:
-        """Store ``paths`` in the data entry using Tcl-list quoting."""
+        """Store ``paths`` in the data entry using Tcl-list quoting.
+
+        NOTE: never pass ``tk.call("list", ...)`` straight to a StringVar —
+        Tkinter returns a *tuple* for list results, and ``StringVar.set``
+        would store its repr, e.g. ``('/some/folder',)``. ``tk.merge`` builds
+        a proper, correctly-quoted Tcl list *string*.
+        """
+        paths = [str(p) for p in paths if p]
         if not paths:
             self.data_var.set("")
             return
         try:
-            tcl = self.root.tk.call("list", *paths)
-            self.data_var.set(tcl)
+            text = self.root.tk.merge(*paths)
+            if not isinstance(text, str):
+                raise TypeError("tk.merge did not return a string")
         except Exception:
-            self.data_var.set(
-                " ".join(f'"{p}"' if (" " in p or "\t" in p) else p
-                         for p in paths))
+            text = " ".join(
+                "{" + p + "}" if any(c.isspace() for c in p) else p
+                for p in paths)
+        self.data_var.set(text)
 
     # ── callbacks ────────────────────────────────────────────────────
     def _browse_data(self):
@@ -1252,8 +1677,12 @@ class TrainingLauncher:
         try:
             files = filedialog.askopenfilenames(
                 parent=self.root,
-                title="Add training text files",
-                filetypes=[("Text files", "*.txt"),
+                title="Add training files (text, JSON, PDF)",
+                filetypes=[("Training data",
+                            "*.txt *.md *.text *.json *.jsonl *.pdf"),
+                           ("Text files", "*.txt *.md *.text"),
+                           ("JSON", "*.json *.jsonl"),
+                           ("PDF", "*.pdf"),
                            ("All files", "*.*")])
         except Exception as exc:
             messagebox.showerror(
@@ -1320,7 +1749,8 @@ class TrainingLauncher:
                     "eval_interval", "eval_batches", "grad_accum",
                     "sample_every", "patience", "num_threads"]
         float_keys = ["dropout", "learning_rate", "min_lr_ratio",
-                      "weight_decay", "label_smoothing", "val_fraction"]
+                      "weight_decay", "label_smoothing", "val_fraction",
+                      "ema_decay", "grad_clip"]
         try:
             for k in int_keys:
                 v = int(self.vars[k].get())
@@ -1345,11 +1775,33 @@ class TrainingLauncher:
                     raise ValueError("weight_decay must be >= 0")
                 if k == "label_smoothing" and v < 0:
                     raise ValueError("label_smoothing must be >= 0")
+                if k == "ema_decay" and not (0.0 <= v < 1.0):
+                    raise ValueError("ema_decay must be in [0, 1) "
+                                     "(0 disables)")
+                if k == "grad_clip" and v < 0:
+                    raise ValueError("grad_clip must be >= 0 (0 disables)")
                 if k == "val_fraction" and not (0.0 < v < 1.0):
                     raise ValueError("val_fraction must be in (0, 1)")
         except ValueError as exc:
-            messagebox.showerror("Invalid hyperparameter", str(exc))
+            msg = str(exc)
+            if msg.startswith(("invalid literal", "could not convert")):
+                msg = f"Please enter a valid number for '{k}'."
+            messagebox.showerror("Invalid hyperparameter", msg)
             return False
+        data_paths = self._parse_data_paths(self.data_var.get())
+        if data_paths:
+            n_files = len(expand_data_specs(
+                data_paths, _parse_extensions(DEFAULT_DATA_EXTS_STR),
+                verbose=False))
+            if n_files == 0:
+                messagebox.showerror(
+                    "No training data",
+                    "None of the selected files or folders contain "
+                    f"{', '.join(DEFAULT_DATA_EXTS)} files:\n\n"
+                    + "\n".join(data_paths[:8]))
+                return False
+            self.status_label.configure(
+                text=f"Data: {n_files:,} file(s) found")
         if self.opt_tie.get() and int(self.vars["embedding_dim"].get()) != \
                 int(self.vars["hidden_size"].get()):
             messagebox.showerror(
@@ -1392,8 +1844,12 @@ class TrainingLauncher:
                     "warmup_steps", "weight_decay", "label_smoothing",
                     "val_fraction", "eval_interval", "eval_batches",
                     "grad_accum", "sample_every", "patience",
-                    "num_threads"]:
+                    "num_threads", "ema_decay", "grad_clip"]:
             cmd += [f"--{key.replace('_', '-')}", self.vars[key].get()]
+        self.run_id = uuid.uuid4().hex[:8]
+        cmd += ["--run-id", self.run_id]
+        if self.vars["json_keys"].get().strip():
+            cmd += ["--json-keys", self.vars["json_keys"].get().strip()]
         cmd += ["--device", _device_value_from_display(self.device_var.get())]
         if self.opt_tie.get():
             cmd.append("--tie-weights")
@@ -1413,13 +1869,14 @@ class TrainingLauncher:
         self.log_text.configure(state=self.tk.DISABLED)
         self.total_steps = int(self.vars["steps"].get())
         self.progress["value"] = 0
+        self._reset_cards()
         self.status_label.configure(text="Starting…")
         self.start_btn.configure(state=self.tk.DISABLED)
         self.stop_btn.configure(state=self.tk.NORMAL)
         self.train_start_ts = time.time()
 
         cmd, self._temp_manifest = self._build_cmd()
-        self._append_log(f"$ {' '.join(cmd)}\n\n")
+        self._append_log(f"$ {_shell_join(cmd)}\n\n")
         try:
             self.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1451,8 +1908,10 @@ class TrainingLauncher:
                     break
                 self._append_log(line + "\n")
                 self._update_progress(line)
+                self._update_metrics(line)
         except queue.Empty:
             pass
+        self._poll_csv()
         if finished:
             rc = self.proc.wait() if self.proc else 0
             self._append_log(f"\n[process exited with code {rc}]\n")
@@ -1468,23 +1927,31 @@ class TrainingLauncher:
 
     def _update_progress(self, line: str):
         m = re.search(r"step\s+(\d+)\s+\|", line)
-        if not m or self.total_steps <= 0:
-            return
-        step = int(m.group(1))
-        pct = 100.0 * step / self.total_steps
-        self.progress["value"] = min(100.0, pct)
-        elapsed = (time.time() - self.train_start_ts
-                   if self.train_start_ts else 0.0)
-        rate = step / elapsed if elapsed > 0 else 0.0
-        remaining = (self.total_steps - step) / rate if rate > 0 \
-            else float("inf")
-        self.status_label.configure(
-            text=f"Step {step:,}/{self.total_steps:,}  ·  {pct:.1f}%  ·  "
-                 f"elapsed {_fmt_hms(elapsed)}  ·  ETA {_fmt_hms(remaining)}")
+        if m and self.total_steps > 0:
+            self._set_progress(int(m.group(1)))
+
+    @staticmethod
+    def _log_tag(text: str) -> str | None:
+        low = text.lstrip().lower()
+        if text.startswith("$"):
+            return "cmd"
+        if "traceback" in low or low.startswith("error") or "[failed" in low:
+            return "err"
+        if low.startswith("warning") or "(could not" in low:
+            return "warn"
+        if ("saved best checkpoint" in low or low.startswith("training finished")
+                or "saved final" in low or "training complete" in low):
+            return "ok"
+        if low.startswith("step"):
+            return "metric"
+        return None
 
     def _append_log(self, text: str):
         self.log_text.configure(state=self.tk.NORMAL)
-        self.log_text.insert(self.tk.END, text)
+        self.log_text.insert(self.tk.END, text, self._log_tag(text) or ())
+        # Keep the widget responsive on very long runs.
+        if int(self.log_text.index("end-1c").split(".")[0]) > 5000:
+            self.log_text.delete("1.0", "1000.0")
         self.log_text.see(self.tk.END)
         self.log_text.configure(state=self.tk.DISABLED)
 
@@ -1568,6 +2035,10 @@ class TrainingLauncher:
     def _reset_ui(self):
         self.proc = None
         self.train_start_ts = None
+        try:
+            self.root.title("Ai-Trainer---chatter")
+        except Exception:
+            pass
         self.start_btn.configure(state=self.tk.NORMAL)
         self.stop_btn.configure(state=self.tk.DISABLED)
 
@@ -1608,7 +2079,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "(# comments and blank lines ignored). Relative paths "
                         "resolve against the manifest's directory. "
                         "Repeatable — use this for corpora of 10k+ files.")
-    p.add_argument("--data-ext", default=".txt,.text,.md",
+    p.add_argument("--json-keys", default="",
+                   help="Comma-separated JSON keys to read, e.g. "
+                        "'text,content'. Default: every string value in "
+                        ".json/.jsonl files.")
+    p.add_argument("--data-ext", default=",".join(DEFAULT_DATA_EXTS),
                    help="Comma-separated extensions picked up when expanding "
                         "directories or globs (default: .txt,.text,.md). "
                         "Pass an empty string to accept any file.")
@@ -1622,7 +2097,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-shuffle", action="store_true",
                    help="Shuffle the file order (seeded by --seed). "
                         "Default is sorted, for deterministic runs.")
-    p.add_argument("--checkpoint", default="tiny_text_model.pt")
+    p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT_NAME,
+                   help="Where to save the best model. Relative paths are "
+                        "anchored to this script's folder, not the "
+                        "current directory.")
     p.add_argument("--log", default="training_log.csv")
     p.add_argument("--run-id", default=str(uuid.uuid4())[:8])
     p.add_argument("--seed", type=int, default=42)
@@ -1636,6 +2114,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--label-smoothing", type=float, default=0.0)
     p.add_argument("--grad-accum", type=int, default=1)
+    p.add_argument("--grad-clip", type=float, default=1.0,
+                   help="Max gradient norm (0 = no clipping). Default 1.0")
+    p.add_argument("--ema-decay", type=float, default=0.999,
+                   help="Exponential moving average of the weights; the "
+                        "averaged model is what gets evaluated and saved. "
+                        "0 disables. Default 0.999")
     # Architecture
     p.add_argument("--embedding-dim", type=int, default=64)
     p.add_argument("--hidden-size", type=int, default=512)

@@ -6,7 +6,9 @@ Usage
     python ask.py --cli                      # terminal REPL
     python ask.py --cli --qa                 # terminal, Q&A mode on
     python ask.py --checkpoint foo.pt        # custom checkpoint
-    python ask.py --no-settings              # ignore ~/.tiny_text_ai_ask.json
+    (the checkpoint is found automatically whichever folder you run this from;
+     if none exists yet you get a prompt to train one or browse for one)
+    python ask.py --no-settings              # ignore ~/.ai_trainer---chatter.json
     python ask.py --gui                      # accepted for train.py compat (no-op)
 
 The GUI is a proper streaming chat window: token-by-token generation,
@@ -25,6 +27,7 @@ import json
 import math
 import queue
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -33,7 +36,14 @@ from pathlib import Path
 
 import torch
 
-from model import CharGRU
+from model import (
+    CharGRU,
+    DEFAULT_CHECKPOINT_NAME,
+    DEFAULT_DATA_DIRNAME,
+    PROJECT_DIR,
+    find_checkpoint,
+    resolve_checkpoint_path,
+)
 
 try:
     import tkinter as tk
@@ -47,10 +57,12 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────
 #  Settings persistence
 # ─────────────────────────────────────────────────────────────────────────
-SETTINGS_PATH = Path.home() / ".tiny_text_ai_ask.json"
+SETTINGS_PATH = Path.home() / ".ai_trainer---chatter.json"
 DEFAULTS = {
     "temperature": 0.7,
     "top_k": 40,
+    "top_p": 0.95,
+    "repeat_penalty": 1.0,
     "max_tokens": 200,
     "seed": "",
     "qa_mode": False,
@@ -156,6 +168,10 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
                        else settings.get("temperature", 0.7),
         "top_k":       args.top_k if args.top_k is not None
                        else settings.get("top_k", 40),
+        "top_p":       args.top_p if args.top_p is not None
+                       else settings.get("top_p", 0.95),
+        "repeat":      args.repeat_penalty if args.repeat_penalty is not None
+                       else settings.get("repeat_penalty", 1.0),
         "max_tokens":  args.max_new_tokens if args.max_new_tokens is not None
                        else settings.get("max_tokens", 200),
         "qa":          args.qa or settings.get("qa_mode", False),
@@ -168,10 +184,12 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
         print(c.dim(
             f"  device={_resolve_device_string(device)}  "
             f"temp={state['temperature']}  top_k={state['top_k'] or 'off'}  "
+            f"top_p={state['top_p'] if 0 < state['top_p'] < 1 else 'off'}  "
+            f"repeat={state['repeat'] if state['repeat'] != 1 else 'off'}  "
             f"max={state['max_tokens']}  qa={'on' if state['qa'] else 'off'}  "
             f"seed={state['seed'] or 'random'}"))
 
-    print(c.bold("◆ Tiny Text AI") + c.dim(" — terminal REPL"))
+    print(c.bold("◆  Ai-Trainer---Chatter") + c.dim(" — terminal REPL"))
     print(c.dim(f"  checkpoint: {checkpoint_path.resolve()}"))
     print(c.dim(f"  best val loss: {ckpt.get('best_validation_loss', float('nan')):.4f}"
                 f"  |  step {ckpt.get('step', '?')}"))
@@ -197,7 +215,7 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
                     {"checkpoint": str(checkpoint_path), "history": history},
                     indent=2), encoding="utf-8")
             else:
-                lines = [f"# Tiny Text AI — {datetime.now():%Y-%m-%d %H:%M}"]
+                lines = [f"# Ai-Trainer---Chatter/ — {datetime.now():%Y-%m-%d %H:%M}"]
                 for h in history:
                     who = "You" if h["role"] == "user" else "AI"
                     lines.append(f"## {who}\n\n{h['content']}")
@@ -220,6 +238,9 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
             print("    /quit              exit")
             print("    /temp <f>          set temperature (0 = greedy)")
             print("    /topk <n>          set top-k (0 = no filtering)")
+            print("    /topp <f>          nucleus sampling, 0-1 (1 = off)")
+            print("    /repeat <f>        repetition penalty, 1.0 = off, "
+                  "1.1-1.3 curbs loops")
             print("    /max <n>           set max new tokens")
             print("    /qa on|off         Q&A mode")
             print("    /stop_nl on|off    stop generation at newline")
@@ -260,6 +281,20 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
                 print(c.dim(f"  top_k = {state['top_k'] or 'off'}"))
             except ValueError:
                 print(c.red("  usage: /topk 40"))
+            return True
+        if name == "topp":
+            try:
+                state["top_p"] = min(1.0, max(0.0, float(val)))
+                print(c.dim(f"  top_p = {state['top_p']}"))
+            except ValueError:
+                print(c.red("  usage: /topp 0.95"))
+            return True
+        if name == "repeat":
+            try:
+                state["repeat"] = max(1.0, float(val))
+                print(c.dim(f"  repetition penalty = {state['repeat']}"))
+            except ValueError:
+                print(c.red("  usage: /repeat 1.15"))
             return True
         if name == "max":
             try:
@@ -338,7 +373,9 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
                         prompt_ids, max_new_tokens=max_new,
                         stop_token_id=stop_id,
                         temperature=state["temperature"],
-                        top_k=state["top_k"] or None):
+                        top_k=state["top_k"] or None,
+                        top_p=state["top_p"] or None,
+                        repetition_penalty=state["repeat"]):
                     ch = characters[cid] if 0 <= cid < len(characters) else "?"
                     out_chars.append(ch)
                     sys.stdout.write(ch)
@@ -348,7 +385,9 @@ def run_cli(checkpoint_path: Path, args, settings: dict) -> int:
                     prompt_ids, max_new_tokens=max_new,
                     stop_token_id=stop_id,
                     temperature=state["temperature"],
-                    top_k=state["top_k"] or None)
+                    top_k=state["top_k"] or None,
+                    top_p=state["top_p"] or None,
+                    repetition_penalty=state["repeat"])
                 tail = out[0].tolist()[len(prompt):]
                 out_chars = [characters[i] for i in tail]
                 sys.stdout.write("".join(out_chars))
@@ -389,6 +428,14 @@ HELP: dict[str, str] = {
     "top_k": "At each step, sample only from the k most likely next characters. "
              "Reduces bizarre rarities without making the output greedy. "
              "0 disables filtering entirely.",
+    "top_p": "Nucleus sampling: sample only from the smallest set of "
+             "characters whose combined probability reaches p. Adapts to "
+             "how confident the model is (unlike top-k). 0.9-0.95 is a "
+             "good default; 1.0 disables.",
+    "repeat_penalty": "Discourages characters used in the last ~32 "
+                      "outputs. 1.0 = off. 1.1-1.3 curbs loops in prose; "
+                      "leave it OFF for arithmetic / Q&A data, where "
+                      "answers legitimately repeat digits.",
     "max_tokens": "Maximum characters to generate per response. Generation may "
                   "stop earlier at a stop token (newline, in Q&A mode).",
     "seed": "Controls sampling randomness. Same seed + same prompt + same "
@@ -414,7 +461,7 @@ HELP: dict[str, str] = {
     "help": "Open the full reference: keyboard shortcuts, sampling guide, and "
             "every control explained.",
     "reset": "Restore the sampling controls to defaults: temperature=0.7, "
-             "top-k=40, max=200, no seed, no Q&A, no stop-at-newline.",
+             "top-k=40, top-p=0.95, repeat penalty off, max=200, no seed, no Q&A, no stop-at-newline.",
     "model": "Full model card: checkpoint path, file size, mtime, parameters, "
              "vocab size, device, and training metadata.",
     "dice": "Generate a random seed. Fill in a specific seed for reproducible "
@@ -518,6 +565,10 @@ class ChatWindow:
         self.temperature = tk.DoubleVar(
             value=float(self.settings.get("temperature", 0.7)))
         self.top_k = tk.IntVar(value=int(self.settings.get("top_k", 40)))
+        self.top_p = tk.DoubleVar(
+            value=float(self.settings.get("top_p", 0.95)))
+        self.repeat_penalty = tk.DoubleVar(
+            value=float(self.settings.get("repeat_penalty", 1.0)))
         self.max_tokens = tk.IntVar(
             value=int(self.settings.get("max_tokens", 200)))
         self.seed_var = tk.StringVar(value=str(self.settings.get("seed", "")))
@@ -561,10 +612,13 @@ class ChatWindow:
 
     # ── window / theme ───────────────────────────────────────────────────
     def _build_ui(self):
-        self.root.title("Tiny Text AI — Chat")
+        self.root.title("Ai-Trainer---Chatter/")
         self.root.configure(bg=GUI_BG)
-        self.root.geometry("1140x760")
-        self.root.minsize(900, 560)
+        # Fit the window to the screen (the sampling sidebar needs ~800 px).
+        _h = min(840, max(600, self.root.winfo_screenheight() - 90))
+        _w = min(1180, max(900, self.root.winfo_screenwidth() - 40))
+        self.root.geometry(f"{_w}x{_h}")
+        self.root.minsize(900, min(_h, 680))
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<Escape>", lambda _e: self._on_stop())
         self.root.bind("<Control-s>", lambda _e: self._on_save())
@@ -581,7 +635,7 @@ class ChatWindow:
         header.pack(side=tk.TOP, fill=tk.X)
         header.pack_propagate(False)
 
-        tk.Label(header, text="◆  Tiny Text AI", bg=GUI_PANEL, fg=GUI_ACCENT,
+        tk.Label(header, text="◆  Ai-Trainer---Chatter/", bg=GUI_PANEL, fg=GUI_ACCENT,
                  font=("TkDefaultFont", 12, "bold"),
                  padx=16).pack(side=tk.LEFT, pady=14)
 
@@ -677,6 +731,11 @@ class ChatWindow:
                          from_=0.0, to=2.0, resolution=0.05, key="temperature")
         self._add_slider(side, "Top-k", self.top_k,
                          from_=0, to=100, resolution=1, key="top_k")
+        self._add_slider(side, "Top-p", self.top_p,
+                         from_=0.1, to=1.0, resolution=0.01, key="top_p")
+        self._add_slider(side, "Repeat penalty", self.repeat_penalty,
+                         from_=1.0, to=1.5, resolution=0.01,
+                         key="repeat_penalty")
         self._add_spinbox(side, "Max tokens", self.max_tokens, 1, 2000,
                           key="max_tokens")
 
@@ -1071,13 +1130,15 @@ class ChatWindow:
             target=self._generate_worker,
             args=(prompt_ids, int(self.max_tokens.get()),
                   stop_id, float(self.temperature.get()),
-                  int(self.top_k.get() or 0)),
+                  int(self.top_k.get() or 0),
+                  float(self.top_p.get()), float(self.repeat_penalty.get())),
             daemon=True,
         )
         thread.start()
         self.root.after(30, self._poll)
 
-    def _generate_worker(self, prompt_ids, max_new, stop_id, temperature, top_k):
+    def _generate_worker(self, prompt_ids, max_new, stop_id, temperature, top_k,
+                         top_p=1.0, repeat_penalty=1.0):
         # Count locally so the stats we push don't depend on the main thread
         # having caught up with the queue.
         count = 0
@@ -1088,6 +1149,8 @@ class ChatWindow:
                 stop_token_id=stop_id,
                 temperature=temperature,
                 top_k=top_k if top_k > 0 else None,
+                top_p=top_p if 0 < top_p < 1 else None,
+                repetition_penalty=repeat_penalty,
                 should_stop=lambda: self._stop_flag,
             ):
                 if 0 <= cid < len(self.characters):
@@ -1256,6 +1319,8 @@ class ChatWindow:
                     "sampling": {
                         "temperature": self.temperature.get(),
                         "top_k": self.top_k.get(),
+                        "top_p": round(self.top_p.get(), 3),
+                        "repeat_penalty": round(self.repeat_penalty.get(), 3),
                         "max_tokens": self.max_tokens.get(),
                         "seed": self.seed_var.get(),
                         "qa_mode": self.qa_mode.get(),
@@ -1265,7 +1330,7 @@ class ChatWindow:
                 }, indent=2, ensure_ascii=False), encoding="utf-8")
             else:
                 lines = [
-                    f"# Tiny Text AI — {datetime.now():%Y-%m-%d %H:%M}",
+                    f"# Ai-Trainer---Chatter/ — {datetime.now():%Y-%m-%d %H:%M}",
                     f"_checkpoint: {self.checkpoint_path.resolve()}_",
                 ]
                 for h in self._history:
@@ -1279,6 +1344,8 @@ class ChatWindow:
     def _on_reset(self):
         self.temperature.set(0.7)
         self.top_k.set(40)
+        self.top_p.set(0.95)
+        self.repeat_penalty.set(1.0)
         self.max_tokens.set(200)
         self.seed_var.set("")
         self.qa_mode.set(False)
@@ -1291,7 +1358,7 @@ class ChatWindow:
 
     def _on_help(self):
         win = tk.Toplevel(self.root)
-        win.title("Help — Tiny Text AI")
+        win.title("Help — Ai-Trainer---Chatter")
         win.configure(bg=GUI_BG)
         win.geometry("760x680")
         text = tk.Text(
@@ -1360,6 +1427,8 @@ class ChatWindow:
             save_settings({
                 "temperature": float(self.temperature.get()),
                 "top_k": int(self.top_k.get()),
+                "top_p": round(float(self.top_p.get()), 3),
+                "repeat_penalty": round(float(self.repeat_penalty.get()), 3),
                 "max_tokens": int(self.max_tokens.get()),
                 "seed": self.seed_var.get(),
                 "qa_mode": bool(self.qa_mode.get()),
@@ -1396,14 +1465,16 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--checkpoint", default="tiny_text_model.pt")
+    p.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT_NAME,
+                   help="Checkpoint to load. Searched in the script folder "
+                        "and the current directory.")
     p.add_argument("--cli", action="store_true",
                    help="Force terminal REPL (default is the GUI)")
     p.add_argument("--gui", action="store_true",
                    help="Accepted for compatibility with train.py "
                         "(GUI is already the default).")
     p.add_argument("--no-settings", action="store_true",
-                   help="Ignore ~/.tiny_text_ai_ask.json")
+                   help="Ignore ~/.ai_trainer---chatter.json")
     p.add_argument("--qa", action="store_true",
                    help="Start with Q&A mode on")
     p.add_argument("--no-stream", action="store_true",
@@ -1412,16 +1483,83 @@ def build_parser() -> argparse.ArgumentParser:
     # CLI sampling defaults (override settings file)
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--top-k", type=int, default=None)
+    p.add_argument("--top-p", type=float, default=None,
+                   help="Nucleus sampling threshold, 0-1 (default 0.95)")
+    p.add_argument("--repeat-penalty", type=float, default=None,
+                   help="Repetition penalty >= 1 (default 1.0 = off)")
     p.add_argument("--max-new-tokens", type=int, default=None)
     return p
+
+
+def _missing_checkpoint_text(requested: str) -> str:
+    target = resolve_checkpoint_path(requested)
+    return (
+        "No trained model found.\n"
+        f"  looked for : {target}\n"
+        f"  also in    : {Path.cwd()}\n\n"
+        "Train one first (the chat opens by itself when training ends):\n"
+        "    python train.py                                  # launcher GUI\n"
+        f"    python train.py --cli --data {DEFAULT_DATA_DIRNAME}"
+        "          # headless\n"
+        "Or point at an existing file:  python ask.py --checkpoint path/to/model.pt"
+    )
+
+
+def _handle_missing_checkpoint(requested: str, want_gui: bool) -> Path | None:
+    """No checkpoint on disk: explain, and (GUI) offer to train or browse.
+
+    Returns a usable checkpoint path, or ``None`` if the user declined / no
+    GUI is available. Never raises — worst case it prints the instructions.
+    """
+    text = _missing_checkpoint_text(requested)
+    if not (want_gui and _can_open_gui()):
+        print(text, file=sys.stderr)
+        return None
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        answer = messagebox.askyesnocancel(
+            "No trained model yet",
+            text + "\n\nYes = open the training launcher\n"
+                   "No = browse for an existing .pt file\n"
+                   "Cancel = quit",
+            parent=root)
+        chosen: Path | None = None
+        if answer is True:
+            script = PROJECT_DIR / "train.py"
+            subprocess.Popen([sys.executable, str(script), "--gui"],
+                             cwd=str(PROJECT_DIR))
+            print("Training launcher opened — the chat window opens "
+                  "automatically when training finishes.")
+        elif answer is False:
+            picked = filedialog.askopenfilename(
+                parent=root, title="Choose a checkpoint",
+                initialdir=str(PROJECT_DIR),
+                filetypes=[("PyTorch checkpoint", "*.pt *.pth"),
+                           ("All files", "*.*")])
+            if picked:
+                chosen = Path(picked)
+        root.destroy()
+        return chosen
+    except Exception as exc:  # never let the helper itself crash the app
+        print(text, file=sys.stderr)
+        print(f"(Could not show the dialog: {exc})", file=sys.stderr)
+        return None
 
 
 def main() -> int:
     args = build_parser().parse_args()
 
-    checkpoint = Path(args.checkpoint)
-    if not checkpoint.exists():
-        sys.exit(f"error: checkpoint not found: {checkpoint}. Run train.py first.")
+    checkpoint = find_checkpoint(args.checkpoint)
+    if checkpoint is None:
+        checkpoint = _handle_missing_checkpoint(
+            args.checkpoint, want_gui=not args.cli)
+        if checkpoint is None:
+            return 2
+    elif Path(args.checkpoint).name == DEFAULT_CHECKPOINT_NAME and \
+            checkpoint.name != DEFAULT_CHECKPOINT_NAME:
+        print(f"(Default checkpoint missing — using newest model found: "
+              f"{checkpoint})")
 
     settings = {} if args.no_settings else load_settings()
 
