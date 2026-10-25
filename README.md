@@ -29,6 +29,7 @@ The project bundles:
 
 ## 📑 Table of Contents
 
+- [Screenshots](#-screenshots)
 - [Overview](#-overview)
 - [Features](#-features)
 - [How It Works](#️-how-it-works)
@@ -48,6 +49,38 @@ The project bundles:
 - [Contributing](#-contributing)
 - [Roadmap](#️-roadmap)
 - [License](#-license)
+
+---
+
+## 📸 Screenshots
+
+A quick tour of the three screens you will use most. All three ship with the project and run locally — no browser, no cloud.
+
+### Training Launcher
+
+![Training Launcher — configure data, model size and schedule, then start training](Pics/Training_Launcher.png)
+
+*`python train.py` — pick your text, choose a preset, tweak any hyperparameter (every field has a `?` help badge), and watch live metrics while the model trains.*
+
+### Live Training Dashboard
+
+![Live Training Dashboard — loss, perplexity, learning rate, gradient norm and throughput](Pics/Training_DAshboard.png)
+
+*`python plot_results.py --live` (opened automatically by `train.py`) — training and validation loss, perplexity, bits per character, generalisation gap, learning rate, gradient norm and throughput, updated while training runs.*
+
+### Chat Window
+
+![Chat Window — streaming chat with sampling controls and a model card](Pics/Chat_DAshboard.png)
+
+*`python ask.py` — token-by-token streaming, adjustable sampling (temperature, top-k, seed), Q&A mode, and a model card showing the loaded checkpoint.*
+
+| Screen | Script | Command | Terminal alternative |
+|---|---|---|---|
+| Training Launcher | `train.py` | `python train.py` | `python train.py --cli` |
+| Live Training Dashboard | `plot_results.py` | `python plot_results.py --live` | `python plot_results.py` (saves a PNG) |
+| Chat Window | `ask.py` | `python ask.py` | `python ask.py --cli` |
+
+> **Contributors:** if you change any of these screens, please refresh the matching image in [`Pics/`](./Pics) — see [CONTRIBUTING.md](./CONTRIBUTING.md#-ui-reference-and-screenshots).
 
 ---
 
@@ -98,6 +131,8 @@ The `CharGRU` model is deliberately simple but well-engineered:
 
 The default entry point opens a **GUI training launcher** — every hyperparameter has a hover tooltip and a `?` badge. Prefer the terminal? Pass `--cli`.
 
+> 📸 See the [Training Launcher screenshot](#training-launcher).
+
 Key behaviors, straight from the code:
 
 - **Data resolution** supports files, directories (walked recursively), and globs.
@@ -121,6 +156,8 @@ Key behaviors, straight from the code:
 
 A dark-themed, 8-panel matplotlib dashboard that updates while training runs.
 
+> 📸 See the [dashboard screenshot](#live-training-dashboard).
+
 | Panel | Metric |
 |---|---|
 | Training loss | Cross-entropy on train batches (raw + 8-point rolling mean) |
@@ -139,6 +176,8 @@ A dark-themed, 8-panel matplotlib dashboard that updates while training runs.
 ### 💬 Chat (`ask.py`)
 
 Two modes, same model:
+
+> 📸 See the [chat window screenshot](#chat-window).
 
 **GUI (default)** — a proper streaming chat window:
 
@@ -252,7 +291,12 @@ Ai-Trainer---Chatter/
 ├── ask.py                   # Chat (GUI window + --cli REPL)
 ├── plot_results.py          # Training dashboard (live window + static PNG)
 ├── generate_data.py         # Synthetic arithmetic Q&A generator
+├── Pics/                    # Screenshots used by README.md and CONTRIBUTING.md
+│   ├── Training_Launcher.png
+│   ├── Training_DAshboard.png
+│   └── Chat_DAshboard.png
 ├── README.md
+├── CONTRIBUTING.md
 └── LICENSE
 ```
 
@@ -275,6 +319,7 @@ Ai-Trainer---Chatter/
 | `plot_results.py` | `load_log`, `draw`, `save_static`, `run_live`. |
 | `generate_data.py` | `generate_examples`, `calculate`, CLI entry. |
 | `1.txt` – `10.txt` | Numbered example files, auto-detected by `train.py`. |
+| `Pics/` | Screenshots of the launcher, dashboard and chat window (documentation only). |
 
 ---
 

@@ -11,6 +11,7 @@ By participating, you agree to be respectful and constructive. Harassment and ho
 - [Ways to Contribute](#-ways-to-contribute)
 - [Setting Up a Development Environment](#️-setting-up-a-development-environment)
 - [Project Architecture](#-project-architecture)
+- [UI Reference and Screenshots](#-ui-reference-and-screenshots)
 - [Manual Smoke Tests](#-manual-smoke-tests)
 - [Coding Conventions](#-coding-conventions)
 - [Recipe: Add a New Training CLI Flag](#-recipe-add-a-new-training-cli-flag)
@@ -34,7 +35,7 @@ By participating, you agree to be respectful and constructive. Harassment and ho
 - Fix typos or stale examples in `README.md`.
 - Expand the **Loss-Reduction Playbook** with a new experiment you ran.
 - Add a short guide for a specific corpus (e.g., "training on a Python codebase").
-- Add screenshots of the training launcher and chat window to the README.
+- Keep the screenshots in [`Pics/`](./Pics) up to date (see [UI Reference and Screenshots](#-ui-reference-and-screenshots)).
 
 ### Bug fixes
 
@@ -141,6 +142,50 @@ Three contracts must stay coherent — breaking one of them silently breaks anot
 1. **Checkpoint schema.** Written by `train.py`, read by `model.CharGRU.from_checkpoint`. Fields: `model_state_dict`, `characters`, `block_size`, `embedding_dim`, `hidden_size`, `num_layers`, `dropout`, `tie_weights`, `best_validation_loss`, `step`. Add fields freely; **never rename or remove them** without a migration path.
 2. **CSV log schema.** `LOG_COLUMNS` in `train.py` must match `NUMERIC` in `plot_results.py` for every numeric column. `prepare_log` auto-rotates the CSV when the header changes, so adding a column is safe for existing users — as long as `plot_results.py` is updated in the same PR.
 3. **Settings file.** `~/.tiny_text_ai_ask.json` uses the `DEFAULTS` dict in `ask.py`. Add keys, never remove; use `settings.get(key, DEFAULTS[key])` when reading.
+
+---
+
+## 📸 UI Reference and Screenshots
+
+These are the three screens a contributor is most likely to change. Look at them before editing the code behind them, and keep the images current when the UI changes.
+
+### Training Launcher — `train.py` (`TrainingLauncher`)
+
+![Training Launcher](Pics/Training_Launcher.png)
+
+*What to preserve:* every control has a `?` badge and tooltip, Start/Stop stay pinned and visible, and the form is pre-filled from CLI arguments. Adding a control? Follow [Recipe: Add a New GUI Control](#-recipe-add-a-new-gui-control).
+
+### Live Training Dashboard — `plot_results.py`
+
+![Live Training Dashboard](Pics/Training_DAshboard.png)
+
+*What to preserve:* `load_log` never raises, the live window refreshes without leaking memory, and the layout still fits the grid. Adding a panel? Follow [Recipe: Add a Dashboard Panel](#-recipe-add-a-dashboard-panel).
+
+### Chat Window — `ask.py` (`ChatWindow`)
+
+![Chat Window](Pics/Chat_DAshboard.png)
+
+*What to preserve:* streaming output, the Stop button (Esc), sampling controls with `?` help, and the model card. Adding a command? Follow [Recipe: Add a Chat Slash Command](#-recipe-add-a-chat-slash-command).
+
+### Updating or adding screenshots
+
+All images live in [`Pics/`](./Pics) and are referenced with **relative paths** from `README.md` and `CONTRIBUTING.md`.
+
+| Guideline | Why |
+|---|---|
+| Use **PNG**, captured at normal (100%) display scaling. | Sharp text, no compression artefacts. |
+| Show **real, working output** — a trained model and a populated dashboard. | Empty plots and error states teach nothing. |
+| Never show private text, file paths with personal names, or credentials. | Screenshots are public. See [Data Privacy](#-data-privacy-and-responsible-corpora). |
+| Keep each file **under ~1 MB** (crop whitespace; optimise with `oxipng` or `pngquant` if needed). | Keeps clones and page loads fast. |
+| Write meaningful **alt text** and a one-line caption naming the command that opens the screen. | Accessibility and discoverability. |
+| Replace an image by **overwriting the same filename** when the screen is merely updated. | Existing links keep working. |
+
+> **Filenames are case-sensitive on GitHub.** The current files are `Training_Launcher.png`, `Training_DAshboard.png` and `Chat_DAshboard.png` — the capital **A** in `DAshboard` is part of the name, so links must match exactly. If you rename them (e.g. to `training_dashboard.png`), update every reference in both Markdown files in the same PR:
+>
+> ```bash
+> git mv Pics/Training_DAshboard.png Pics/training_dashboard.png
+> grep -rn "Training_DAshboard" README.md CONTRIBUTING.md   # find every link to fix
+> ```
 
 ---
 
@@ -260,7 +305,7 @@ Add a row to the README's [Hyperparameters Reference](./README.md#️-hyperparam
 
 ## 🍳 Recipe: Add a New GUI Control
 
-The GUI system uses `field()`, `pair()`, `_help_badge()`, and `Tooltip`. The pattern:
+The GUI system uses `field()`, `pair()`, `_help_badge()`, and `Tooltip`. See the [Training Launcher screenshot](#training-launcher--trainpy-traininglauncher) for what the finished form looks like. The pattern:
 
 ```python
 # 1. Add to HELP at the top of the file
@@ -283,7 +328,7 @@ Rules:
 
 ## 🍳 Recipe: Add a Chat Slash Command
 
-Every command in `ask.py`'s CLI REPL is a branch inside `_handle_command`. To add `/echo`:
+Every command in `ask.py`'s CLI REPL is a branch inside `_handle_command` (the GUI counterpart is shown in the [chat window screenshot](#chat-window--askpy-chatwindow)). To add `/echo`:
 
 ```python
 # inside _handle_command, before the final "unknown command" branch
@@ -306,7 +351,7 @@ GUI equivalents (if applicable) go through `HELP` entries and buttons in `_build
 
 ## 🍳 Recipe: Add a Dashboard Panel
 
-`plot_results.py` is driven by two parallel lists. Adding a panel is a three-file change:
+`plot_results.py` is driven by two parallel lists. Adding a panel is a three-file change (see the [dashboard screenshot](#live-training-dashboard--plot_resultspy) for the current layout):
 
 ### 1. Emit the metric from `train.py`
 
@@ -563,7 +608,7 @@ Open the PR against `main`. Include:
 - **Why** — the problem this solves.
 - **How you tested it** — which smoke tests, on which OS/device.
 - **Backwards compatibility** — anything that could break old checkpoints, old CSVs, or the settings file.
-- **Screenshots** — for any UI change.
+- **Screenshots** — for any UI change, include before/after images in the PR **and** refresh the matching file in [`Pics/`](./Pics) (see [UI Reference and Screenshots](#-ui-reference-and-screenshots)).
 - **Known limitations** — anything you consciously left out.
 
 PRs that skip the "how you tested" section will be asked to add it before merge. This is not gatekeeping — the maintainers can't reproduce your environment.

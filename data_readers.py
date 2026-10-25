@@ -40,10 +40,13 @@ from typing import Any, Iterable
 JSON_SUFFIXES = {".json"}
 JSONL_SUFFIXES = {".jsonl", ".ndjson"}
 PDF_SUFFIXES = {".pdf"}
-BINARY_SUFFIXES = PDF_SUFFIXES            # formats that must not be .decode()d
+PARQUET_SUFFIXES = {".parquet"}
+BINARY_SUFFIXES = PDF_SUFFIXES | PARQUET_SUFFIXES  # formats that must not be .decode()d directly
 
 _INSTALL_HINT = ("PDF support needs a PDF library. Install one with:  "
                  "pip install pypdf")
+_PARQUET_HINT = ("Parquet support needs pyarrow or pandas. Install with:  "
+                  "pip install pyarrow pandas")
 
 
 # ── JSON ─────────────────────────────────────────────────────────────────
@@ -107,6 +110,77 @@ def extract_jsonl(text: str, json_keys: Iterable[str] | None = None) -> str:
     if bad and not blocks:
         raise ValueError("not valid JSON Lines (no line parsed)")
     return "\n\n".join(b for b in blocks if b)
+
+
+# ── PARQUET ──────────────────────────────────────────────────────────────
+def _record_to_text(row: dict[str, Any], keys: set[str] | None) -> str:
+    """Format one Parquet row/record. Supports prompt/messages conversation schema."""
+    parts: list[str] = []
+
+    # Schema check for 'messages' (conversation array)
+    messages = row.get("messages")
+    if isinstance(messages, (list, tuple)) and messages:
+        msg_parts = []
+        for msg in messages:
+            if isinstance(msg, dict):
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if content:
+                    if role:
+                        msg_parts.append(f"{role.capitalize()}: {content}")
+                    else:
+                        msg_parts.append(str(content))
+        if msg_parts:
+            parts.append("\n".join(msg_parts))
+
+    # If 'prompt' exists and isn't already covered
+    prompt = row.get("prompt")
+    if prompt and isinstance(prompt, str) and not parts:
+        parts.append(prompt.strip())
+
+    # Fallback or additional keys handling
+    if not parts or keys is not None:
+        filtered_row = {}
+        for k, v in row.items():
+            k_str = str(k).lower()
+            # Exclude ID fields like 'prompt_id' by default unless explicitly in keys
+            if keys is None and k_str.endswith("_id"):
+                continue
+            filtered_row[k] = v
+        sub_text = _record_text(filtered_row, keys)
+        if sub_text and sub_text not in parts:
+            parts.append(sub_text)
+
+    return "\n\n".join(parts)
+
+
+def extract_parquet(raw: bytes, json_keys: Iterable[str] | None = None) -> str:
+    """Extract training text from Parquet file bytes."""
+    keys = _normalise_keys(json_keys)
+    records: list[dict[str, Any]] = []
+
+    # Try pyarrow
+    try:
+        import pyarrow.parquet as pq
+        table = pq.read_table(io.BytesIO(raw))
+        records = table.to_pylist()
+    except ImportError:
+        # Fallback to pandas
+        try:
+            import pandas as pd
+            df = pd.read_parquet(io.BytesIO(raw))
+            records = df.to_dict(orient="records")
+        except ImportError:
+            try:
+                import fastparquet
+                pf = fastparquet.ParquetFile(io.BytesIO(raw))
+                df = pf.to_pandas()
+                records = df.to_dict(orient="records")
+            except ImportError as exc:
+                raise RuntimeError(_PARQUET_HINT) from exc
+
+    blocks = [_record_to_text(rec, keys) for rec in records]
+    return "\n\n".join(b for b in blocks if b.strip())
 
 
 # ── PDF ──────────────────────────────────────────────────────────────────
@@ -188,9 +262,24 @@ def extract_text(path: Path | str, raw: bytes, encoding: str = "utf-8",
     suffix = Path(path).suffix.lower()
     if suffix in PDF_SUFFIXES:
         return extract_pdf(raw)
+    if suffix in PARQUET_SUFFIXES:
+        return extract_parquet(raw, json_keys)
+
     enc = "utf-8-sig" if encoding.lower().replace("_", "-") in ("utf-8", "utf8") \
         else encoding
-    text = raw.decode(enc, errors=errors)
+
+    # Smart fallback decoding: avoid replacing CP1252/Latin-1 bytes with \ufffd
+    try:
+        text = raw.decode(enc)
+    except UnicodeDecodeError:
+        try:
+            text = raw.decode("cp1252")
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("latin1")
+            except UnicodeDecodeError:
+                text = raw.decode(enc, errors=errors)
+
     if suffix in JSON_SUFFIXES:
         return extract_json(text, json_keys)
     if suffix in JSONL_SUFFIXES:

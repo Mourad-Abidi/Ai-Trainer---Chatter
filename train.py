@@ -117,7 +117,7 @@ BASE_CHARACTERS = (
 LOG_COLUMNS = ["run_id", "step", "elapsed", "train_loss", "val_loss",
                "lr", "grad_norm", "tokens_per_sec", "train_clean", "session"]
 _LEGACY_LOG_COLUMNS = LOG_COLUMNS[:8]
-DEFAULT_DATA_EXTS = (".txt", ".text", ".md", ".json", ".jsonl", ".pdf")
+DEFAULT_DATA_EXTS = (".txt", ".text", ".md", ".json", ".jsonl", ".pdf", ".parquet")
 DEFAULT_DATA_EXTS_STR = ",".join(DEFAULT_DATA_EXTS)
 
 
@@ -603,6 +603,12 @@ def _validate_training_args(args: argparse.Namespace) -> None:
 #  Training (used by CLI and by the GUI-spawned subprocess)
 # ─────────────────────────────────────────────────────────────────────────
 def run_training(args: argparse.Namespace) -> int:
+    if getattr(args, "export_gguf", None):
+        from export_gguf import export_checkpoint_to_gguf
+        out_f = export_checkpoint_to_gguf(args.checkpoint, args.export_gguf)
+        print(f"Exported model checkpoint to GGUF: {out_f}")
+        return 0
+
     _validate_training_args(args)
 
     # Anchor the checkpoint to the project folder (not the shell's CWD) so
@@ -1870,6 +1876,12 @@ class TrainingLauncher:
                               command=self._open_dashboard)
         dash_btn.pack(side=tk.RIGHT, padx=(0, 6))
         Tooltip(dash_btn, HELP["open_dashboard"], clickable=False)
+        report_btn = ttk.Button(ctrl, text="Report",
+                                command=self._open_report)
+        report_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        gguf_btn = ttk.Button(ctrl, text="Export GGUF",
+                              command=self._export_gguf_gui)
+        gguf_btn.pack(side=tk.RIGHT, padx=(0, 6))
 
         self._build_monitor(right)
         form.columnconfigure(5, weight=1)
@@ -2151,6 +2163,33 @@ class TrainingLauncher:
             subprocess.Popen([sys.executable, str(script), "--gui",
                               "--checkpoint", str(ckpt)])
         except Exception as exc:
+            self._append_log(f"[could not open chat: {exc}]\n")
+
+    def _open_report(self):
+        try:
+            from training_report import show_report_window
+            show_report_window(self.root, str(self._log_file()))
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Report Error", f"Could not open report window: {exc}")
+
+    def _export_gguf_gui(self):
+        from tkinter import filedialog, messagebox
+        from export_gguf import export_checkpoint_to_gguf
+        ckpt = resolve_checkpoint_path(self.vars["checkpoint"].get().strip() or None)
+        out_p = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export Trained Model to GGUF",
+            defaultextension=".gguf",
+            filetypes=[("GGUF Model", "*.gguf"), ("All files", "*.*")],
+            initialfile="ai_trainer_model.gguf"
+        )
+        if out_p:
+            try:
+                out_f = export_checkpoint_to_gguf(ckpt, out_p)
+                messagebox.showinfo("Export Success", f"GGUF model exported successfully:\n{out_f}", parent=self.root)
+            except Exception as exc:
+                messagebox.showerror("Export Failed", f"Could not export GGUF model: {exc}", parent=self.root)
             self._append_log(f"[could not open chat: {exc}]\n")
 
     # ── data-file list helpers ───────────────────────────────────────
@@ -2466,9 +2505,13 @@ class TrainingLauncher:
                 self.progress["value"] = 100.0
                 self.status_label.configure(text="Training complete ✓")
             else:
-                self.status_label.configure(text=f"Exited with code {rc}")
+                self.status_label.configure(text=f"Stopped (code {rc})")
             self._reset_ui()
             self._cleanup_temp_manifest()
+            try:
+                self.root.after(300, self._open_report)
+            except Exception:
+                pass
             return
         self.root.after(120, self._poll_log)
 
@@ -2641,6 +2684,7 @@ class TrainingLauncher:
         self.stop_btn.configure(state=self.tk.DISABLED)
         try:
             self.resume_cb.configure(state=self.tk.NORMAL)
+            self.opt_resume.set(True)
             self._refresh_model_info()
         except Exception:
             pass
@@ -2704,6 +2748,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Where to save the best model. Relative paths are "
                         "anchored to this script's folder, not the "
                         "current directory.")
+    p.add_argument("--export-gguf", metavar="PATH",
+                   help="Export the model checkpoint to GGUF format for LM Studio / Ollama / Bionic.")
     p.add_argument("--log", default="training_log.csv")
     p.add_argument("--run-id", default=str(uuid.uuid4())[:8])
     p.add_argument("--seed", type=int, default=42)

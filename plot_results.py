@@ -8,21 +8,10 @@ train.py opens the live window automatically (use --no-live to disable).
 What you see
 ------------
 * A strip of headline numbers (total steps, best score, perplexity, ...).
-* Eight graphs. Click the ``?`` on any graph (or "explain every graph" at the
-  top right) for a plain-English explanation of what it shows and what good
-  and bad look like.
+* Ten graphs. Click "Expand" to pop out a graph in a new separate window, or
+  click "?" on any graph for a plain-English explanation.
 * Training is CUMULATIVE: every session of the same model continues the same
   curves. Dotted vertical lines mark where a new session started.
-
-Accuracy notes
---------------
-* Runs are ordered by when they were written to the log (not by their random
-  ids), so "latest session" really is the latest.
-* The overfitting gap uses ``train_clean`` (training text measured exactly
-  like validation: no dropout, averaged weights). Older logs without that
-  column fall back to the smoothed training loss.
-* The live window re-reads the log once per second but only redraws when the
-  file actually changed, and shows whether training is still running.
 """
 from __future__ import annotations
 
@@ -33,10 +22,24 @@ import textwrap
 import time
 
 import matplotlib
-import numpy as np
-import pandas as pd
+try:
+    import numpy as np
+    import pandas as pd
+except ImportError:
+    np = None
+    pd = None
 from matplotlib.patches import FancyBboxPatch
 from matplotlib.ticker import FuncFormatter
+
+try:
+    import tkinter as tk
+    from tkinter import ttk
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    TK_AVAILABLE = True
+except ImportError:
+    TK_AVAILABLE = False
+    tk = None
+    ttk = None
 
 LOG_FILE = "training_log.csv"
 OUTPUT_IMAGE_PATH = "training_dashboard.png"
@@ -140,10 +143,22 @@ def _latest_lineage(df: pd.DataFrame, max_runs: int) -> pd.DataFrame:
 def load_log(path, run_id=None, all_runs=False, max_runs=8):
     """Read the CSV log tolerantly. Returns ``None`` if there is nothing to
     draw yet (missing / empty / half-written file)."""
-    try:
-        df = pd.read_csv(path, on_bad_lines="skip")
-    except (OSError, ValueError):
-        return None
+    if pd is None:
+        import csv
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                reader = list(csv.DictReader(f))
+            if not reader:
+                return None
+            import pandas as pdd
+            df = pdd.DataFrame(reader)
+        except Exception:
+            return None
+    else:
+        try:
+            df = pd.read_csv(path, on_bad_lines="skip")
+        except (OSError, ValueError, Exception):
+            return None
     if not REQUIRED.issubset(df.columns):
         return None
     for col in NUMERIC:
@@ -153,8 +168,7 @@ def load_log(path, run_id=None, all_runs=False, max_runs=8):
     df = df.dropna(subset=["step"])
     if df.empty:
         return None
-    # Chronological = order of first appearance in the file. (Sorting by the
-    # random run id would put runs in alphabetical, i.e. wrong, order.)
+
     order = {r: i for i, r in enumerate(dict.fromkeys(df["run_id"]))}
     df["_ord"] = df["run_id"].map(order)
     df = df.sort_values(["_ord", "step"], kind="stable").reset_index(drop=True)
@@ -183,11 +197,11 @@ def run_labels(df: pd.DataFrame) -> dict:
 
 # ── figure construction ──────────────────────────────────────────────────
 def make_figure(plt, live=False):
-    fig = plt.figure(figsize=(18.5, 10) if live else (21, 11.2),
+    fig = plt.figure(figsize=(15.0, 9.5) if live else (16.0, 10.0),
                      facecolor=BG)
-    gs = fig.add_gridspec(3, 4, height_ratios=[0.5, 1, 1], hspace=0.55,
-                          wspace=0.27, left=0.045, right=0.988,
-                          top=0.905, bottom=0.075)
+    gs = fig.add_gridspec(3, 4, height_ratios=[0.45, 1, 1], hspace=0.52,
+                          wspace=0.28, left=0.04, right=0.96,
+                          top=0.91, bottom=0.065)
     fig._kpi = fig.add_subplot(gs[0, :])
     axes = [fig.add_subplot(gs[1 + i // 4, i % 4]) for i in range(8)]
     fig._artists = {}
@@ -199,7 +213,7 @@ def make_figure(plt, live=False):
 
 def _style(ax, title, ylabel, xlabel):
     ax.set_facecolor(CARD)
-    ax.set_title(title, color=HI, fontsize=10.5, pad=9, loc="left",
+    ax.set_title(title, color=HI, fontsize=10.0, pad=9, loc="left",
                  fontweight="bold")
     ax.set_xlabel(xlabel, color=TEXT, fontsize=8)
     ax.set_ylabel(ylabel, color=TEXT, fontsize=8)
@@ -214,7 +228,6 @@ def _style(ax, title, ylabel, xlabel):
 
 
 def _set_text(fig, name, x, y, text, **kw):
-    """Create-or-replace a figure-level text (so redraws never stack)."""
     old = fig._artists.pop(name, None)
     if old is not None:
         try:
@@ -226,8 +239,6 @@ def _set_text(fig, name, x, y, text, **kw):
 
 
 def _fit_loss_ylim(ax, arrays):
-    """Zoom the y-axis on the interesting part: ignore the huge first
-    values (random-guess loss) that otherwise flatten the whole curve."""
     parts = [a[np.isfinite(a)] for a in arrays if len(a)]
     if not parts:
         return
@@ -263,7 +274,6 @@ def _kpi_cards(ax, cards):
 
 # ── drawing ──────────────────────────────────────────────────────────────
 def _status(vals):
-    """Plain-English verdict from the latest validation scores."""
     if len(vals) < 3:
         return "● warming up — waiting for more test results", TEXT
     v = vals["val_loss"].to_numpy()
@@ -299,7 +309,7 @@ def draw(fig, axes, df, interactive=False, file_age=None):
         for r in runs:
             sub = df[df["run_id"] == r][["step", key]].dropna()
             if key == "tokens_per_sec" and len(sub) > 1:
-                sub = sub.iloc[1:]           # first interval includes start-up
+                sub = sub.iloc[1:]
             if sub.empty:
                 continue
             color = colors[r]
@@ -319,7 +329,7 @@ def draw(fig, axes, df, interactive=False, file_age=None):
             if key == "val_loss":
                 zoom.append(sub[key].to_numpy())
                 clean = df[df["run_id"] == r][["step", "train_clean"]].dropna()
-                if len(clean) > 1:        # study-text score, same method
+                if len(clean) > 1:
                     ax.plot(clean["step"], clean["train_clean"], color=color,
                             linewidth=1.1, linestyle="--", alpha=0.55,
                             zorder=1)
@@ -350,32 +360,42 @@ def draw(fig, axes, df, interactive=False, file_age=None):
         elif key == "lr":
             ax.ticklabel_format(axis="y", style="sci", scilimits=(-2, 2))
             ax.yaxis.get_offset_text().set_color(TEXT)
-        if multi:                        # where each continued session began
+        if multi:
             for _r, x0 in starts[1:]:
                 ax.axvline(x0, color="#5b6275", linewidth=0.9,
                            linestyle=(0, (2, 3)), zorder=1)
+
+        # Legend positioned cleanly inside subplot boundary (above/upper right)
         if key == "val_loss" and any(ax.lines):
             h1, = ax.plot([], [], color=TEXT, linewidth=1.7, marker="o",
                           markersize=3.2)
             h2, = ax.plot([], [], color=TEXT, linestyle="--", linewidth=1.1,
                           alpha=0.7)
-            leg = ax.legend([h1, h2], ["validation (exam)",
-                                       "train (same test)"], fontsize=7.5,
-                            facecolor=CARD, edgecolor=GRID, labelcolor=TEXT,
-                            loc="upper right")
+            leg = ax.legend([h1, h2], ["val (exam)", "train (test)"],
+                            fontsize=7.0, facecolor=CARD, edgecolor=GRID, labelcolor=TEXT,
+                            loc="lower right", bbox_to_anchor=(1.0, 1.01))
             leg.get_frame().set_alpha(0.85)
-        if multi and key == "train_loss" and any(ax.lines):
-            leg = ax.legend(fontsize=7.5, facecolor=CARD, edgecolor=GRID,
-                            labelcolor=TEXT, loc="upper right")
+        elif multi and key == "train_loss" and any(ax.lines):
+            leg = ax.legend(fontsize=7.0, facecolor=CARD, edgecolor=GRID,
+                            labelcolor=TEXT, loc="lower right", bbox_to_anchor=(1.0, 1.01))
             leg.get_frame().set_alpha(0.85)
+
         if not any(l.get_xdata().size for l in ax.lines):
             ax.text(0.5, 0.5, "no data yet", transform=ax.transAxes,
                     ha="center", va="center", color=TEXT, fontsize=9,
                     alpha=0.6)
 
-        if interactive:                  # plain-English help on demand
+        if interactive:
+            # Expand button on header
+            exp = ax.text(0.80, 1.035, " ⤢ Expand ", transform=ax.transAxes,
+                          ha="right", va="bottom", fontsize=8.0,
+                          fontweight="bold", color=ACCENT, picker=True,
+                          bbox=dict(boxstyle="round,pad=0.2", fc=CARD,
+                                    ec=ACCENT, lw=0.8))
+            exp._expand_key = key
+
             q = ax.text(1.0, 1.035, " ? ", transform=ax.transAxes,
-                        ha="right", va="bottom", fontsize=10,
+                        ha="right", va="bottom", fontsize=9.5,
                         fontweight="bold", color=ACCENT, picker=True,
                         bbox=dict(boxstyle="round,pad=0.25", fc=CARD,
                                   ec=ACCENT, lw=0.9))
@@ -454,10 +474,10 @@ def draw(fig, axes, df, interactive=False, file_age=None):
     else:
         badge = "snapshot · " + time.strftime("%Y-%m-%d %H:%M")
         bcolor = TEXT
-    _set_text(fig, "live", 0.988, 0.972, badge, color=bcolor, fontsize=10.5,
+    _set_text(fig, "live", 0.96, 0.972, badge, color=bcolor, fontsize=10.5,
               fontweight="bold", ha="right", va="center")
     if interactive:
-        g = _set_text(fig, "helpall", 0.988, 0.935,
+        g = _set_text(fig, "helpall", 0.96, 0.935,
                       "  ?  explain every graph  ", color=ACCENT, fontsize=9,
                       fontweight="bold", ha="right", va="center", picker=True,
                       bbox=dict(boxstyle="round,pad=0.3", fc=CARD, ec=ACCENT,
@@ -476,13 +496,59 @@ def draw(fig, axes, df, interactive=False, file_age=None):
         parts.append("dotted lines = new session")
     _set_text(fig, "footer", 0.012, 0.018, "   ·   ".join(parts), color=TEXT,
               fontsize=9, ha="left", va="center")
-    _set_text(fig, "status", 0.988, 0.018, status_text, color=status_color,
+    _set_text(fig, "status", 0.96, 0.018, status_text, color=status_color,
               fontsize=10, fontweight="bold", ha="right", va="center")
 
 
 # ── interactivity ────────────────────────────────────────────────────────
+def popout_graph_window(key: str, df: pd.DataFrame):
+    """Open a separate window with an enlarged, interactive view of a graph."""
+    if not TK_AVAILABLE or df is None:
+        return
+    try:
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return
+
+    title_map = {p[0]: p[1] for p in PANELS}
+    title = title_map.get(key, key)
+
+    top = tk.Toplevel()
+    top.title(f"Expanded Graph — {title}")
+    top.geometry("900x600")
+    top.configure(bg=BG)
+
+    fig, ax = plt.subplots(figsize=(8, 5), facecolor=BG)
+    _style(ax, title, "", "step")
+
+    runs = list(dict.fromkeys(df["run_id"]))
+    colors = {r: PALETTE[i % len(PALETTE)] for i, r in enumerate(runs)}
+    labels = run_labels(df)
+
+    for r in runs:
+        sub = df[df["run_id"] == r][["step", key]].dropna()
+        if not sub.empty:
+            ax.plot(sub["step"], sub[key], color=colors[r], label=labels[r], linewidth=2.0)
+
+    leg = ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1.0), facecolor=CARD, edgecolor=GRID, labelcolor=TEXT)
+    if leg:
+        leg.get_frame().set_alpha(0.85)
+
+    canvas = FigureCanvasTkAgg(fig, master=top)
+    canvas.draw()
+    toolbar = NavigationToolbar2Tk(canvas, top)
+    toolbar.update()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+
 def _on_pick(event):
     fig = event.canvas.figure
+    exp_key = getattr(event.artist, "_expand_key", None)
+    if exp_key and fig._df is not None:
+        popout_graph_window(exp_key, fig._df)
+        return
+
     key = getattr(event.artist, "_help_key", None)
     if key is None:
         return
@@ -535,6 +601,114 @@ def run_live(log, run_id, interval, save_png=False, out=OUTPUT_IMAGE_PATH,
         print("No GUI backend available (headless?). Use "
               "`python plot_results.py` for a PNG instead.")
         return
+
+    # If Tkinter is available, launch as a scrollable Tkinter App with Collapsible Logs
+    if TK_AVAILABLE:
+        root = tk.Tk()
+        root.title("Ai-Trainer — Live Dashboard & Log Monitor")
+        root.geometry("1200x850")
+        root.configure(bg=BG)
+
+        # Header Control Bar
+        hdr = tk.Frame(root, bg=CARD, height=50)
+        hdr.pack(fill=tk.X, side=tk.TOP)
+
+        tk.Label(hdr, text="◆ Ai-Trainer · Live Dashboard", bg=CARD, fg=HI, font=("TkDefaultFont", 12, "bold"), padx=12).pack(side=tk.LEFT, pady=10)
+
+        def open_report():
+            try:
+                from training_report import show_report_window
+                show_report_window(root, log)
+            except Exception as exc:
+                print(f"Could not open report window: {exc}")
+
+        ttk.Button(hdr, text="📊 Full Report", command=open_report).pack(side=tk.RIGHT, padx=8)
+
+        # Scrollable Frame for Canvas
+        container = tk.Frame(root, bg=BG)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, bg=BG, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scroll_content = tk.Frame(canvas, bg=BG)
+
+        window_id = canvas.create_window((0, 0), window=scroll_content, anchor="nw")
+        def _on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=event.width)
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=v_scroll.set)
+
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Matplotlib Figure inside Scroll Content
+        fig, axes = make_figure(plt, live=True)
+        fig._panels = axes
+        fig._age = None
+        fig.canvas.mpl_connect("pick_event", _on_pick)
+
+        fig_canvas = FigureCanvasTkAgg(fig, master=scroll_content)
+        fig_canvas.draw()
+        fig_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+
+        # Collapsible Background Log Section at Bottom
+        log_frame = tk.LabelFrame(scroll_content, text=" 📜 Background Activity Logs ", bg=CARD, fg=ACCENT, font=("TkDefaultFont", 10, "bold"), padx=10, pady=6)
+        log_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        log_visible = tk.BooleanVar(value=False)
+        log_text_box = tk.Text(log_frame, bg=BG, fg=HI, height=8, font=("TkFixedFont", 9), wrap=tk.NONE)
+        log_text_box.pack_forget()  # Hidden by default
+
+        def toggle_logs():
+            if log_visible.get():
+                log_text_box.pack_forget()
+                log_visible.set(False)
+                toggle_btn.configure(text="▼ Show Background Logs")
+            else:
+                log_text_box.pack(fill=tk.BOTH, expand=True, pady=4)
+                log_visible.set(True)
+                toggle_btn.configure(text="▲ Hide Background Logs")
+
+        toggle_btn = ttk.Button(log_frame, text="▼ Show Background Logs", command=toggle_logs)
+        toggle_btn.pack(side=tk.TOP, anchor="w", pady=2)
+
+        def update():
+            try:
+                sig, mtime = _stat_sig(log)
+                if sig is not None and sig != fig._sig:
+                    df = load_log(log, run_id, all_runs, max_runs)
+                    if df is not None:
+                        fig._sig, fig._df = sig, df
+                        fig._age = max(0.0, time.time() - mtime)
+                        draw(fig, axes, df, interactive=True, file_age=fig._age)
+                        fig.canvas.draw_idle()
+                        if save_png:
+                            fig.savefig(out, dpi=100, facecolor=fig.get_facecolor())
+
+                        # Update background logs lazily
+                        if log_visible.get() and os.path.exists(log):
+                            try:
+                                with open(log, "r", encoding="utf-8", errors="ignore") as f:
+                                    lines = f.readlines()[-100:]
+                                log_text_box.configure(state=tk.NORMAL)
+                                log_text_box.delete("1.0", tk.END)
+                                log_text_box.insert(tk.END, "".join(lines))
+                                log_text_box.see(tk.END)
+                                log_text_box.configure(state=tk.DISABLED)
+                            except Exception:
+                                pass
+                        return
+            except Exception as exc:
+                print(f"(dashboard refresh skipped: {exc})")
+
+            root.after(max(250, int(interval * 1000)), update)
+
+        root.after(200, update)
+        root.mainloop()
+        return
+
+    # Fallback to standard matplotlib popup if Tkinter unavailable
     fig, axes = make_figure(plt, live=True)
     fig._panels = axes
     fig._age = None
@@ -561,7 +735,6 @@ def run_live(log, run_id, interval, save_png=False, out=OUTPUT_IMAGE_PATH,
                         fig.savefig(out, dpi=100,
                                     facecolor=fig.get_facecolor())
                     return
-            # Nothing new: only keep the LIVE / idle badge honest.
             if sig is not None and fig._df is not None:
                 age = max(0.0, time.time() - mtime)
                 live = age <= LIVE_SECONDS
@@ -573,13 +746,13 @@ def run_live(log, run_id, interval, save_png=False, out=OUTPUT_IMAGE_PATH,
                     t.set_color(GOOD if live else TEXT)
                     fig._age = age
                     fig.canvas.draw_idle()
-        except Exception as exc:  # never let one bad frame close the window
+        except Exception as exc:
             print(f"(dashboard refresh skipped: {exc})")
 
     timer = fig.canvas.new_timer(interval=max(250, int(interval * 1000)))
     timer.add_callback(update)
     timer.start()
-    fig._timer = timer           # keep a reference so it isn't collected
+    fig._timer = timer
     update()
     plt.show()
 
@@ -591,10 +764,9 @@ def main():
     ap.add_argument("--log", default=LOG_FILE)
     ap.add_argument("--out", default=OUTPUT_IMAGE_PATH)
     ap.add_argument("--run-id", default=None,
-                    help="Only plot this one run (default: the newest "
-                         "session and the sessions it continued from)")
+                    help="Only plot this one run")
     ap.add_argument("--all-runs", action="store_true",
-                    help="Plot every run in the log, even unrelated ones")
+                    help="Plot every run in the log")
     ap.add_argument("--max-runs", type=int, default=8,
                     help="Most sessions to draw at once (default 8)")
     ap.add_argument("--live", action="store_true",

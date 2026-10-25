@@ -463,6 +463,7 @@ HELP: dict[str, str] = {
     "clear": "Clear the transcript. Sampling settings and seed are unchanged.",
     "save": "Save the transcript to a file. Use .md for human-readable markdown "
             "or .json for a re-loadable transcript.",
+    "export": "Export the loaded model checkpoint to GGUF format for LM Studio, Ollama, or Bionic.",
     "copy": "Copy the entire transcript to the clipboard.",
     "help": "Open the full reference: keyboard shortcuts, sampling guide, and "
             "every control explained.",
@@ -654,6 +655,7 @@ class ChatWindow:
 
         for text, cmd, key in [
             ("?  Help", self._on_help, "help"),
+            ("Export GGUF", self._on_export_gguf, "export"),
             ("Copy all", self._on_copy_all, "copy"),
             ("Save…", self._on_save, "save"),
             ("Clear", self._on_clear, "clear"),
@@ -1305,6 +1307,26 @@ class ChatWindow:
             self._set_status("Copied to clipboard")
         except tk.TclError:
             pass
+
+    def _on_export_gguf(self):
+        from export_gguf import export_checkpoint_to_gguf
+        ckpt = self.checkpoint_path
+        if not ckpt or not Path(ckpt).is_file():
+            messagebox.showerror("Export Failed", "No valid checkpoint found to export.", parent=self.root)
+            return
+        out_p = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Export Model to GGUF",
+            defaultextension=".gguf",
+            filetypes=[("GGUF Model", "*.gguf"), ("All files", "*.*")],
+            initialfile="ai_trainer_model.gguf"
+        )
+        if out_p:
+            try:
+                out_f = export_checkpoint_to_gguf(ckpt, out_p)
+                messagebox.showinfo("Export Success", f"GGUF model exported to:\n{out_f}", parent=self.root)
+            except Exception as exc:
+                messagebox.showerror("Export Failed", f"Could not export GGUF model: {exc}", parent=self.root)
 
     def _on_save(self):
         if not self._history:
